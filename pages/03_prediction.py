@@ -1,1 +1,255 @@
 # 미래 부하 예측 결과를 보여주는 페이지를 구성한다.
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from src.data.schemas import PredictionResult, RiskLine
+from src.services.prediction_service import PredictionService
+
+# ── 페이지 설정 ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="부하 예측 | SGOP",
+    page_icon="📈",
+    layout="wide",
+)
+
+# ── 상수 ──────────────────────────────────────────────────────────────────────
+_ALL_BUSES = [
+    ("BUS_001", "서울"), ("BUS_002", "인천"), ("BUS_003", "수원"),
+    ("BUS_004", "춘천"), ("BUS_005", "강릉"), ("BUS_006", "원주"),
+    ("BUS_007", "대전"), ("BUS_008", "청주"), ("BUS_009", "광주"),
+    ("BUS_010", "전주"), ("BUS_011", "대구"), ("BUS_012", "울산"),
+    ("BUS_013", "부산"),
+]
+_DEFAULT_BUSES = ["BUS_001", "BUS_007", "BUS_011", "BUS_013"]
+
+_RISK_COLOR = {
+    "critical": "#e74c3c",
+    "high":     "#e67e22",
+    "medium":   "#f1c40f",
+}
+_RISK_LABEL = {
+    "critical": "🔴 위험",
+    "high":     "🟠 경고",
+    "medium":   "🟡 주의",
+}
+
+# ── 사이드바 ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("예측 설정")
+
+    load_scale = st.slider(
+        "부하 배율",
+        min_value=0.80, max_value=1.30, value=1.00, step=0.05,
+        help="1.0 = 기본 부하. 1.2 = 20% 증가 시나리오.",
+    )
+
+    bus_options = {name: bid for bid, name in _ALL_BUSES}
+    default_names = [name for bid, name in _ALL_BUSES if bid in _DEFAULT_BUSES]
+    selected_names = st.multiselect(
+        "그래프에 표시할 노드",
+        options=list(bus_options.keys()),
+        default=default_names,
+    )
+    selected_bus_ids = [bus_options[n] for n in selected_names]
+
+    st.divider()
+    run_btn = st.button("예측 실행", type="primary", use_container_width=True)
+
+# ── Session State 초기화 ───────────────────────────────────────────────────────
+if "pred_result" not in st.session_state:
+    st.session_state.pred_result = None
+if "pred_scale" not in st.session_state:
+    st.session_state.pred_scale = None
+
+# ── 예측 실행 (버튼 or 최초 진입) ─────────────────────────────────────────────
+if run_btn or st.session_state.pred_result is None:
+    with st.spinner("예측 계산 중..."):
+        svc = PredictionService()
+        st.session_state.pred_result = svc.run_mock_prediction(load_scale=load_scale)
+        st.session_state.pred_scale = load_scale
+
+result: PredictionResult = st.session_state.pred_result
+
+# ── 헤더 ──────────────────────────────────────────────────────────────────────
+st.title("📈 24시간 부하 예측")
+st.caption(
+    f"기준 시각: {result.created_at:%Y-%m-%d %H:%M}  |  "
+    f"소스: {result.source.upper()}  |  "
+    f"부하 배율: {result.load_scale:.0%}  |  "
+    f"시나리오: {result.scenario_id}"
+)
+
+# ── 요약 배너 ─────────────────────────────────────────────────────────────────
+n_critical = sum(1 for r in result.risk_lines if r.risk_level == "critical")
+n_high     = sum(1 for r in result.risk_lines if r.risk_level == "high")
+n_medium   = sum(1 for r in result.risk_lines if r.risk_level == "medium")
+
+col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+col_s1.metric("예측 구간", f"{result.forecast_horizon_h}시간")
+col_s2.metric("위험 선로", n_critical, delta=f"high {n_high}", delta_color="inverse")
+col_s3.metric("주의 선로", n_medium)
+
+# 피크 시각
+hourly_total: dict[int, float] = {}
+for p in result.predictions:
+    h = p.timestamp.hour
+    hourly_total[h] = hourly_total.get(h, 0.0) + p.predicted_load_mw
+peak_h = max(hourly_total, key=hourly_total.__getitem__)
+peak_ts = result.created_at.replace(hour=peak_h) + (
+    timedelta(days=1) if peak_h <= result.created_at.hour else timedelta()
+)
+col_s4.metric("예측 피크", f"{peak_ts:%H:%M}")
+
+st.info(result.summary)
+
+st.divider()
+
+# ── Section 1: 예측 그래프 ────────────────────────────────────────────────────
+st.subheader("시간대별 부하 예측")
+
+pred_df = pd.DataFrame([
+    {
+        "timestamp": p.timestamp,
+        "bus_id": p.bus_id,
+        "predicted_load_mw": p.predicted_load_mw,
+        "confidence_lower_mw": p.confidence_lower_mw,
+        "confidence_upper_mw": p.confidence_upper_mw,
+    }
+    for p in result.predictions
+])
+
+bus_id_to_name = {bid: name for bid, name in _ALL_BUSES}
+
+if not selected_bus_ids:
+    st.warning("사이드바에서 노드를 1개 이상 선택하세요.")
+else:
+    fig = go.Figure()
+
+    for bus_id in selected_bus_ids:
+        bus_df = pred_df[pred_df["bus_id"] == bus_id].sort_values("timestamp")
+        name = bus_id_to_name.get(bus_id, bus_id)
+        timestamps = bus_df["timestamp"].tolist()
+
+        # 신뢰구간 밴드
+        fig.add_trace(go.Scatter(
+            x=timestamps + timestamps[::-1],
+            y=bus_df["confidence_upper_mw"].tolist() + bus_df["confidence_lower_mw"].tolist()[::-1],
+            fill="toself",
+            fillcolor="rgba(100,100,200,0.08)",
+            line={"width": 0},
+            showlegend=False,
+            hoverinfo="skip",
+            name=f"{name} CI",
+        ))
+
+        # 예측값 라인
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=bus_df["predicted_load_mw"],
+            mode="lines+markers",
+            name=name,
+            marker={"size": 4},
+            line={"width": 2},
+            hovertemplate=f"<b>{name}</b><br>%{{x|%H:%M}}<br>%{{y:,.0f}} MW<extra></extra>",
+        ))
+
+    # 현재 시각 수직선
+    now_str = result.created_at.isoformat()
+    fig.add_shape(
+        type="line",
+        x0=now_str, x1=now_str, y0=0, y1=1,
+        xref="x", yref="paper",
+        line={"dash": "dot", "color": "gray", "width": 1.5},
+    )
+    fig.add_annotation(
+        x=now_str, y=1, xref="x", yref="paper",
+        text="현재", showarrow=False,
+        font={"color": "gray", "size": 11},
+        xanchor="left", yanchor="bottom",
+    )
+
+    fig.update_layout(
+        xaxis_title="시각",
+        yaxis_title="예측 부하 (MW)",
+        legend={"orientation": "h", "y": -0.2},
+        hovermode="x unified",
+        height=420,
+        margin={"t": 20, "b": 60},
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ── Section 2: 위험도 카드 ────────────────────────────────────────────────────
+st.subheader("위험 선로 목록")
+
+if not result.risk_lines:
+    st.success("예측 구간 내 위험 선로가 없습니다.")
+else:
+    top_lines = result.risk_lines[:6]  # 최대 6개
+    cols = st.columns(min(3, len(top_lines)))
+
+    for idx, rline in enumerate(top_lines):
+        col = cols[idx % 3]
+        color = _RISK_COLOR.get(rline.risk_level, "#95a5a6")
+        label = _RISK_LABEL.get(rline.risk_level, rline.risk_level)
+        util_pct = int(rline.predicted_utilization * 100)
+
+        with col:
+            st.markdown(
+                f"""
+                <div style="
+                    border-left: 4px solid {color};
+                    padding: 12px 14px;
+                    border-radius: 6px;
+                    background: #fafafa;
+                    margin-bottom: 12px;
+                ">
+                    <div style="font-size:0.78rem; color:#666;">{rline.line_id}</div>
+                    <div style="font-size:1.05rem; font-weight:600;">
+                        {rline.from_bus_name} → {rline.to_bus_name}
+                    </div>
+                    <div style="margin-top:6px;">
+                        <span style="
+                            background:{color}22; color:{color};
+                            padding:2px 8px; border-radius:4px;
+                            font-size:0.82rem; font-weight:600;
+                        ">{label}</span>
+                        &nbsp;
+                        <span style="font-size:0.85rem; color:#333;">
+                            이용률 <b>{util_pct}%</b>
+                        </span>
+                    </div>
+                    <div style="font-size:0.78rem; color:#888; margin-top:4px;">
+                        피크 예상: {rline.peak_risk_hour:02d}:00
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+st.divider()
+
+# ── Section 3: 설명 카드 (xAI) ────────────────────────────────────────────────
+st.subheader("AI 설명")
+
+if not result.risk_lines:
+    st.info("위험 선로가 없어 설명이 생성되지 않았습니다.")
+else:
+    for rline in result.risk_lines:
+        color = _RISK_COLOR.get(rline.risk_level, "#95a5a6")
+        label = _RISK_LABEL.get(rline.risk_level, rline.risk_level)
+        with st.expander(
+            f"{label}  {rline.from_bus_name}–{rline.to_bus_name} ({rline.line_id})",
+            expanded=(rline.risk_level == "critical"),
+        ):
+            col_e1, col_e2, col_e3 = st.columns(3)
+            col_e1.metric("이용률", f"{int(rline.predicted_utilization * 100)}%")
+            col_e2.metric("피크 시각", f"{rline.peak_risk_hour:02d}:00")
+            col_e3.metric("위험 등급", label)
+            st.markdown(f"> {rline.explanation}")
