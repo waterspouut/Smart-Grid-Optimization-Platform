@@ -1,3 +1,8 @@
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
 .env
 .env.*
 !.env.example
@@ -15,3 +20,5 @@ data/private/*
 *.crt
 *.p12
 service-account*.json
+
+.claude/
