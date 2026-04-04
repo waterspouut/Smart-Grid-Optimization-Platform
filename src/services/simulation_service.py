@@ -7,13 +7,18 @@ from datetime import datetime
 from src.data.schemas import (
     FallbackInfo,
     RecommendationResult,
-    RoutePoint,
-    RouteResult,
     ScenarioContext,
     ScoreBreakdown,
     SimulationDelta,
     SimulationInput,
     SimulationResult,
+)
+from src.engine.search.astar_router import BusNodeSpec, RouteCandidateSpec, build_mock_route
+from src.engine.search.score_function import (
+    CandidateScoreInput,
+    build_recommendation,
+    calculate_mock_score,
+    rank_recommendations,
 )
 
 
@@ -120,7 +125,7 @@ class SimulationService:
         deltas = self._build_mock_deltas(resolved_input, recommendations[0] if recommendations else None)
 
         warnings = input_warnings + [
-            "SimulationService는 현재 A* 탐색과 점수화 엔진 대신 mock 시뮬레이션 결과를 반환합니다.",
+            "SimulationService는 현재 search 엔진의 mock route/score 계약 함수를 사용합니다.",
         ]
 
         return SimulationResult(
@@ -136,7 +141,7 @@ class SimulationService:
             fallback=FallbackInfo(
                 enabled=True,
                 mode="mock_data",
-                reason="A* 경로 탐색과 score_function 엔진이 아직 연결되지 않아 mock 결과를 사용합니다.",
+                reason="실제 A* 탐색 대신 astar_router/score_function의 mock 계약 함수를 사용합니다.",
                 primary_path="src.engine.search.astar_router -> src.engine.search.score_function",
                 active_path="src.services.simulation_service.SimulationService.run_mock_simulation",
             ),
@@ -202,13 +207,34 @@ class SimulationService:
         simulation_input: SimulationInput,
     ) -> list[RecommendationResult]:
         scored_recommendations: list[RecommendationResult] = []
+        start_bus = _to_bus_node_spec(simulation_input.start_bus_id)
+        end_bus = _to_bus_node_spec(simulation_input.end_bus_id)
+        hub_bus_id = "BUS_007" if simulation_input.end_bus_id != "BUS_007" else "BUS_010"
+        hub_bus = _to_bus_node_spec(hub_bus_id)
 
         for index, candidate_id in enumerate(simulation_input.candidate_site_ids):
             candidate = _get_candidate(candidate_id, index)
-            route = self._build_mock_route(simulation_input, candidate_id, candidate, index)
-            score = self._build_mock_score(simulation_input, candidate)
+            route = build_mock_route(
+                start_bus=start_bus,
+                end_bus=end_bus,
+                candidate=_to_route_candidate_spec(candidate_id, candidate),
+                via_bus=hub_bus,
+                load_scale=simulation_input.load_scale,
+            )
+            score = calculate_mock_score(
+                CandidateScoreInput(
+                    candidate_id=candidate_id,
+                    candidate_label=str(candidate["label"]),
+                    distance_km=float(candidate["distance_km"]),
+                    construction_cost=float(candidate["construction_cost"]),
+                    congestion_relief=float(candidate["congestion_relief"]),
+                    environmental_risk=float(candidate["environmental_risk"]),
+                    policy_risk=float(candidate["policy_risk"]),
+                    load_scale=simulation_input.load_scale,
+                )
+            )
             scored_recommendations.append(
-                RecommendationResult(
+                build_recommendation(
                     candidate_id=candidate_id,
                     candidate_label=str(candidate["label"]),
                     route=route,
@@ -217,111 +243,7 @@ class SimulationService:
                 )
             )
 
-        scored_recommendations.sort(
-            key=lambda recommendation: (
-                recommendation.score.total_score if recommendation.score else float("-inf")
-            ),
-            reverse=True,
-        )
-
-        for rank, recommendation in enumerate(scored_recommendations, start=1):
-            recommendation.rank = rank
-
-        return scored_recommendations
-
-    def _build_mock_route(
-        self,
-        simulation_input: SimulationInput,
-        candidate_id: str,
-        candidate: dict[str, float | str],
-        index: int,
-    ) -> RouteResult:
-        start_bus = _get_bus(simulation_input.start_bus_id)
-        end_bus = _get_bus(simulation_input.end_bus_id)
-        hub_bus_id = "BUS_007" if simulation_input.end_bus_id != "BUS_007" else "BUS_010"
-        hub_bus = _get_bus(hub_bus_id)
-        scale_penalty = max(0.0, simulation_input.load_scale - 1.0) * 6.0
-        total_distance = round(float(candidate["distance_km"]) + (index * 3.5) + scale_penalty, 1)
-        estimated_cost = round((total_distance * 0.42) + float(candidate["construction_cost"]) * 4.8, 1)
-
-        return RouteResult(
-            route_id=f"route-{candidate_id.lower()}",
-            start_bus_id=simulation_input.start_bus_id,
-            end_bus_id=simulation_input.end_bus_id,
-            path_node_ids=[
-                simulation_input.start_bus_id,
-                hub_bus_id,
-                candidate_id,
-                simulation_input.end_bus_id,
-            ],
-            waypoints=[
-                RoutePoint(
-                    point_id=simulation_input.start_bus_id,
-                    label=str(start_bus["name"]),
-                    latitude=float(start_bus["latitude"]),
-                    longitude=float(start_bus["longitude"]),
-                ),
-                RoutePoint(
-                    point_id=hub_bus_id,
-                    label=str(hub_bus["name"]),
-                    latitude=float(hub_bus["latitude"]),
-                    longitude=float(hub_bus["longitude"]),
-                ),
-                RoutePoint(
-                    point_id=candidate_id,
-                    label=str(candidate["label"]),
-                    latitude=float(candidate["latitude"]),
-                    longitude=float(candidate["longitude"]),
-                ),
-                RoutePoint(
-                    point_id=simulation_input.end_bus_id,
-                    label=str(end_bus["name"]),
-                    latitude=float(end_bus["latitude"]),
-                    longitude=float(end_bus["longitude"]),
-                ),
-            ],
-            total_distance_km=total_distance,
-            estimated_cost=estimated_cost,
-            source="mock",
-            summary=(
-                f"{start_bus['name']}에서 {end_bus['name']}까지 "
-                f"{candidate['label']}을 경유하는 mock 경로입니다."
-            ),
-        )
-
-    def _build_mock_score(
-        self,
-        simulation_input: SimulationInput,
-        candidate: dict[str, float | str],
-    ) -> ScoreBreakdown:
-        load_bonus = max(0.0, simulation_input.load_scale - 1.0) * 18.0
-        distance_cost = round(float(candidate["distance_km"]) * 0.58, 1)
-        construction_cost = round(float(candidate["construction_cost"]) * 1.85, 1)
-        congestion_relief = round(float(candidate["congestion_relief"]) + load_bonus, 1)
-        environmental_risk = round(float(candidate["environmental_risk"]) * 2.2, 1)
-        policy_risk = round(float(candidate["policy_risk"]) * 2.0, 1)
-        total_score = round(
-            100.0
-            + congestion_relief
-            - distance_cost
-            - construction_cost
-            - environmental_risk
-            - policy_risk,
-            1,
-        )
-
-        return ScoreBreakdown(
-            total_score=total_score,
-            distance_cost=distance_cost,
-            construction_cost=construction_cost,
-            congestion_relief=congestion_relief,
-            environmental_risk=environmental_risk,
-            policy_risk=policy_risk,
-            notes=[
-                "현재 점수는 mock 가중치로 계산됩니다.",
-                "2주차에 astar_router와 score_function 결과로 교체할 예정입니다.",
-            ],
-        )
+        return rank_recommendations(scored_recommendations)
 
     def _build_rationale(
         self,
@@ -458,3 +380,27 @@ def _get_candidate(candidate_id: str, index: int) -> dict[str, float | str]:
         "environmental_risk": 4.5 + (index * 0.6),
         "policy_risk": 3.0 + (index * 0.4),
     }
+
+
+def _to_bus_node_spec(bus_id: str) -> BusNodeSpec:
+    bus = _get_bus(bus_id)
+    return BusNodeSpec(
+        bus_id=bus_id,
+        label=str(bus["name"]),
+        latitude=float(bus["latitude"]),
+        longitude=float(bus["longitude"]),
+    )
+
+
+def _to_route_candidate_spec(
+    candidate_id: str,
+    candidate: dict[str, float | str],
+) -> RouteCandidateSpec:
+    return RouteCandidateSpec(
+        candidate_id=candidate_id,
+        candidate_label=str(candidate["label"]),
+        latitude=float(candidate["latitude"]),
+        longitude=float(candidate["longitude"]),
+        base_distance_km=float(candidate["distance_km"]),
+        construction_cost=float(candidate["construction_cost"]),
+    )

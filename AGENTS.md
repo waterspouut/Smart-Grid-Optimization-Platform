@@ -39,7 +39,8 @@
 - `Prediction` 페이지는 아직 기존 구현 기준이며 공통 `ScenarioContext` 공유는 다음 정리 대상이다.
 - `src/data/schemas.py`가 페이지/서비스 간 공통 계약의 기준 파일이다.
 - `data/mock`에는 아직 실제 fixture 파일이 없다.
-- `src/domain`, `src/engine/search`, `src/engine/powerflow`의 다수 파일은 여전히 한 줄 스텁이다.
+- `src/engine/search/astar_router.py`, `src/engine/search/score_function.py`는 1주차용 mock 엔진 계약과 비용 요소 초안이 들어가 있다.
+- `src/domain`, `src/engine/powerflow`의 다수 파일은 여전히 한 줄 스텁이다.
 
 ## 잊지 말아야 할 핵심 구조
 - 전체 흐름은 `app.py -> pages/* -> src/services/* -> src/engine/* -> src/data/* / src/domain/*`이다.
@@ -127,11 +128,15 @@
 - `3순위` 작업으로 `pages/01_monitoring.py`, `pages/02_simulation.py`를 서비스 호출 기반 페이지로 구현했다.
 - 두 페이지는 페이지 내부 mock 결과를 만들지 않고 각각 `MonitoringService`, `SimulationService`의 반환 객체만 렌더링한다.
 - `Monitoring`과 `Simulation`은 같은 Streamlit session state 키로 `ScenarioContext`를 공유한다.
+- `4순위` 작업으로 `src/engine/search/astar_router.py`, `src/engine/search/score_function.py`에 mock route/score 계약을 구현했다.
+- `astar_router.py`는 `RouteResult`를 반환하는 mock 경로 함수와 최소 입력 스펙을 제공한다.
+- `score_function.py`는 비용 요소 상수, `ScoreBreakdown` 계산, `RecommendationResult` 생성/정렬 계약을 제공한다.
+- `SimulationService`는 자체 route/score 계산을 하지 않고 search 엔진의 mock 계약 함수를 호출하도록 정리했다.
 
 ## 앞으로 작업할 때 우선순위
 1. `Monitoring`, `Simulation`, `Prediction`이 같은 `ScenarioContext`를 공유하도록 페이지 흐름을 맞춘다.
-2. `A*`, 점수화, power flow 같은 엔진 구현으로 내려간다.
-3. mock 결과를 실제 엔진 결과로 치환하면서 `warnings`와 `fallback` 규칙을 유지한다.
+2. mock 결과를 실제 엔진 결과로 치환하면서 `warnings`와 `fallback` 규칙을 유지한다.
+3. `A*`, 점수화, power flow 같은 엔진 구현으로 내려간다.
 4. 필요하면 `ScenarioService`에 시나리오 저장/불러오기 책임을 옮긴다.
 
 ## 작업 타임라인 규칙
