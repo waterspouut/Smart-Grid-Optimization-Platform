@@ -7,32 +7,37 @@
 
 ## 작업 시작 전 필수 확인
 - 먼저 `git status --short`를 확인한다.
+- `AGENTS.md`를 읽었으면 이어서 루트의 `WORK_TIMELINE.md`도 반드시 읽는다.
 - 현재 워크트리는 더럽혀져 있을 수 있다. 내가 만들지 않은 변경은 되돌리지 않는다.
-- `Monitoring`, `Simulation`, `A*` 관련 모듈은 아직 대부분 스텁이다.
+- `Monitoring`, `Simulation` 서비스에는 mock 반환 뼈대가 들어가 있지만, 페이지와 엔진 연결은 아직 대부분 스텁이다.
 - 현재 구현 기준점은 `Prediction` 쪽이다. 새 기능은 이 흐름을 참고하되, 페이지별 하드코딩을 늘리지 않는다.
 - 외부 API, 실제 데이터, 모델 파일이 없어도 mock 기준으로 동작해야 한다.
+- 작업을 시작할 때는 `WORK_TIMELINE.md`의 최신 항목을 확인하고, 작업이 끝나면 같은 파일에 결과와 검증 내용을 추가한다.
 
 ## 반드시 먼저 읽을 파일
 1. `meeting_plan/MEETING_PLAN_2026-03-30.md`
 2. `DEVELOPMENT_FLOW_2026-03-30.md`
-3. `src/data/schemas.py`
-4. `app.py`
-5. `pages/03_prediction.py`
-6. `src/services/prediction_service.py`
-7. `pages/01_monitoring.py`
-8. `pages/02_simulation.py`
-9. `src/services/monitoring_service.py`
-10. `src/services/simulation_service.py`
-11. `src/engine/search/astar_router.py`
-12. `src/engine/search/score_function.py`
-13. `src/engine/forecast/feature_builder.py`
-14. `src/config/settings.py`
+3. `WORK_TIMELINE.md`
+4. `src/data/schemas.py`
+5. `app.py`
+6. `pages/03_prediction.py`
+7. `src/services/prediction_service.py`
+8. `pages/01_monitoring.py`
+9. `pages/02_simulation.py`
+10. `src/services/monitoring_service.py`
+11. `src/services/simulation_service.py`
+12. `src/engine/search/astar_router.py`
+13. `src/engine/search/score_function.py`
+14. `src/engine/forecast/feature_builder.py`
+15. `src/config/settings.py`
 
 ## 현재 저장소 상태
-- `pages/03_prediction.py`와 `src/services/prediction_service.py`만 목업 수준 구현이 있다.
+- `pages/03_prediction.py`와 `src/services/prediction_service.py`는 목업 수준 구현이 있다.
+- `src/services/monitoring_service.py`와 `src/services/simulation_service.py`는 공통 계약 기준의 mock 반환 뼈대가 구현되어 있다.
+- `pages/01_monitoring.py`와 `pages/02_simulation.py`는 아직 거의 비어 있다.
 - `src/data/schemas.py`가 페이지/서비스 간 공통 계약의 기준 파일이다.
 - `data/mock`에는 아직 실제 fixture 파일이 없다.
-- `src/domain`, `src/services`, `src/engine/search`, `src/engine/powerflow`의 다수 파일은 한 줄 스텁이다.
+- `src/domain`, `src/engine/search`, `src/engine/powerflow`의 다수 파일은 여전히 한 줄 스텁이다.
 
 ## 잊지 말아야 할 핵심 구조
 - 전체 흐름은 `app.py -> pages/* -> src/services/* -> src/engine/* -> src/data/* / src/domain/*`이다.
@@ -113,12 +118,22 @@
   - `ScoreBreakdown`
   - 보조 타입 (`MonitoringKpi`, `LineStatusSnapshot`, `RoutePoint`, `RecommendationResult`, `SimulationDelta`, `TimeSeriesPoint`)
 - 기존 `PredictionResult`는 깨지지 않도록 `scenario`, `warnings`, `fallback` 필드를 기본값과 함께 확장했다.
+- `2순위` 작업으로 `src/services/monitoring_service.py`, `src/services/simulation_service.py`에 mock 반환 뼈대를 추가했다.
+- `MonitoringService`는 `MonitoringResult`를 직접 반환하며 KPI, 선로 상태, 추세 포인트, summary, warnings, fallback을 함께 만든다.
+- `SimulationService`는 `SimulationInput` 기본값 생성과 `SimulationResult` 반환 뼈대를 제공하며 route, recommendation, score, delta, summary, warnings, fallback을 함께 만든다.
+- 두 서비스 모두 같은 `ScenarioContext`를 넘기면 동일한 `scenario_id`를 유지하도록 맞췄다.
 
 ## 앞으로 작업할 때 우선순위
-1. `src/data/schemas.py` 기준으로 서비스 반환 형식을 통일한다.
-2. `Monitoring`과 `Simulation` 서비스에 mock 반환 뼈대를 만든다.
-3. 각 페이지가 서비스만 호출하도록 정리한다.
-4. 그다음에 `A*`, 점수화, power flow 같은 엔진 구현으로 내려간다.
+1. 각 페이지가 서비스만 호출하도록 정리한다.
+2. `Monitoring`, `Simulation`, `Prediction`이 같은 `ScenarioContext`를 공유하도록 페이지 흐름을 맞춘다.
+3. `A*`, 점수화, power flow 같은 엔진 구현으로 내려간다.
+4. mock 결과를 실제 엔진 결과로 치환하면서 `warnings`와 `fallback` 규칙을 유지한다.
+
+## 작업 타임라인 규칙
+- 작업 타임라인 기준 파일은 루트의 `WORK_TIMELINE.md`다.
+- 새 작업을 시작할 때는 가장 최근 항목을 먼저 읽고 현재 우선순위와 마지막 변경 지점을 확인한다.
+- 작업 중 의미 있는 변경이 끝나면 `날짜`, `작업 요약`, `수정 파일`, `검증`, `다음 작업`을 한 항목으로 추가한다.
+- `AGENTS.md`의 현재 상태와 `WORK_TIMELINE.md`의 최신 항목이 충돌하면 더 최근 날짜의 `WORK_TIMELINE.md`를 우선 참고하고, 필요하면 `AGENTS.md`도 함께 갱신한다.
 
 ## 검증 규칙
 - 코드 수정 후 최소한 `python3 -m compileall app.py pages src`는 실행한다.
