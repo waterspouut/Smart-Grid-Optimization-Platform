@@ -6,6 +6,8 @@ from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import folium
+from streamlit_folium import st_folium
 
 from src.data.schemas import ScenarioContext, SimulationInput, SimulationResult
 from src.services.simulation_service import SimulationService
@@ -153,44 +155,51 @@ st.divider()
 col_left, col_right = st.columns([1.1, 1.2])
 
 with col_left:
-    st.subheader("선정 경로")
+    st.subheader("🗺️ 선정 경로 (지도 시각화)")
+    
     if result.selected_route is None or not result.selected_route.waypoints:
         st.info("표시할 경로 정보가 없습니다.")
     else:
-        route_df = pd.DataFrame(
-            [
-                {
-                    "point_id": waypoint.point_id,
-                    "label": waypoint.label,
-                    "latitude": waypoint.latitude,
-                    "longitude": waypoint.longitude,
-                }
-                for waypoint in result.selected_route.waypoints
-            ]
-        )
-
-        route_fig = go.Figure()
-        route_fig.add_trace(
-            go.Scatter(
-                x=route_df["longitude"],
-                y=route_df["latitude"],
-                mode="lines+markers+text",
-                text=route_df["label"],
-                textposition="top center",
-                line={"width": 3, "color": "#1f77b4"},
-                marker={"size": 10, "color": "#d62728"},
-                hovertemplate="%{text}<br>위도 %{y:.3f}<br>경도 %{x:.3f}<extra></extra>",
-                name="경로",
-            )
-        )
-        route_fig.update_layout(
-            height=360,
-            margin={"t": 20, "b": 20},
-            xaxis_title="경도",
-            yaxis_title="위도",
-            showlegend=False,
-        )
-        st.plotly_chart(route_fig, width="stretch")
+        # 1. 경로를 그리기 위해 [위도, 경도] 쌍의 리스트를 만듭니다.
+        route_coords = [
+            [waypoint.latitude, waypoint.longitude]
+            for waypoint in result.selected_route.waypoints
+        ]
+        
+        # 2. 지도가 처음 켜질 때 중심을 잡아줄 좌표를 설정합니다. (경로의 시작점)
+        center_lat = route_coords[0][0]
+        center_lon = route_coords[0][1]
+        
+        # 3. 브이월드 또는 기본 오픈스트리트맵(OSM) 기반 Folium 지도 생성
+        # (tiles='CartoDB positron'을 쓰면 피그마 디자인처럼 깔끔하고 밝은 테마가 나옵니다)
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles='CartoDB positron')
+        
+        # 4. 지도 위에 오름님이 계산한 A* 경로 선(PolyLine) 그리기
+        folium.PolyLine(
+            locations=route_coords,
+            color="#2563eb",  # 예쁜 파란색
+            weight=5,
+            opacity=0.8,
+            tooltip="선정된 A* 최적 경로"
+        ).add_to(m)
+        
+        # 5. 시작점, 종료점, 후보지 등 각 노드에 마커 찍기
+        for waypoint in result.selected_route.waypoints:
+            # 기본 마커 대신 예쁜 동그라미 마커 사용
+            folium.CircleMarker(
+                location=[waypoint.latitude, waypoint.longitude],
+                radius=6, # 마커 크기
+                popup=f"<b>{waypoint.label}</b><br>({waypoint.point_id})",
+                tooltip=waypoint.label,
+                color="#ef4444", # 테두리 빨간색
+                fill=True,
+                fill_color="#ef4444",
+                fill_opacity=1.0
+            ).add_to(m)
+            
+        # 6. 완성된 지도를 Streamlit 화면에 띄우기
+        # returned_objects=[] 로 설정하면 지도를 클릭해도 불필요한 재계산(rerun)이 돌지 않습니다.
+        st_folium(m, width=600, height=400, returned_objects=[])
 
 with col_right:
     st.subheader("설치 전후 비교")
