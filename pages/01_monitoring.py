@@ -1,11 +1,14 @@
 # 송전망 혼잡 상태를 보여주는 모니터링 페이지를 구성한다.
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.services.monitoring_service import run_mock_monitoring
+from src.data.schemas import MonitoringKpi, MonitoringResult, ScenarioContext
+from src.services.monitoring_service import MonitoringService
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 
@@ -33,13 +36,49 @@ _STATUS_BG: dict[str, str] = {
 # ── 페이지 설정 ────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="모니터링 | SGOP", layout="wide")
-st.title("송전망 혼잡도 모니터링")
-st.caption("선로별 이용률과 혼잡 상태를 실시간으로 확인합니다. (1주차 mock 데이터)")
+
+# ── 공유 시나리오 헬퍼 ─────────────────────────────────────────────────────────
+
+def _get_shared_scenario() -> ScenarioContext:
+    scenario = st.session_state.get("sgop_shared_scenario")
+    if isinstance(scenario, ScenarioContext):
+        return scenario
+    scenario = ScenarioContext(
+        scenario_id="sgop-demo-scenario",
+        title="SGOP Demo Scenario",
+        description="Monitoring과 Simulation이 공유하는 기본 시나리오",
+        region="South Korea",
+        created_at=datetime.now().replace(minute=0, second=0, microsecond=0),
+        created_by="streamlit-session",
+    )
+    st.session_state.sgop_shared_scenario = scenario
+    return scenario
+
+
+def _fmt_kpi_value(kpi: MonitoringKpi) -> str:
+    if kpi.unit == "lines":
+        return f"{int(kpi.value)}개"
+    if kpi.unit == "%":
+        return f"{kpi.value:.1f}%"
+    return f"{kpi.value:,.1f} {kpi.unit}"
+
+
+def _fmt_kpi_delta(kpi: MonitoringKpi) -> str | None:
+    if kpi.delta is None:
+        return None
+    sign = "+" if kpi.delta >= 0 else ""
+    if kpi.unit == "lines":
+        return f"경고 {int(kpi.delta)}개"
+    if kpi.unit == "MW":
+        return f"{sign}{kpi.delta:,.1f} MW"
+    return f"{sign}{kpi.delta:.1f}%"
 
 # ── 사이드바 ───────────────────────────────────────────────────────────────────
 
+service = MonitoringService()
+
 with st.sidebar:
-    st.header("파라미터")
+    st.header("모니터링 설정")
     load_scale = st.slider(
         "부하 배율",
         min_value=0.5,
@@ -55,42 +94,38 @@ with st.sidebar:
 
 # ── 데이터 로드 ────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=30)
-def _load(scale: float):
-    return run_mock_monitoring(scale)
+with st.spinner("모니터링 결과를 생성하는 중입니다..."):
+    result: MonitoringResult = service.run_mock_monitoring(
+        scenario=_get_shared_scenario(),
+        load_scale=load_scale,
+    )
 
-
-result = _load(load_scale)
-s = result.summary
+st.session_state.sgop_shared_scenario = result.scenario
+cs = result.congestion_summary
 lines = result.line_statuses
+
+# ── 헤더 + fallback 알림 ───────────────────────────────────────────────────────
+
+st.title("송전망 혼잡도 모니터링")
+st.caption(
+    f"기준 시각: {result.created_at:%Y-%m-%d %H:%M}  |  "
+    f"소스: {result.source.upper()}  |  "
+    f"시나리오: {result.scenario.scenario_id}"
+)
+st.info(result.summary)
+
+if result.fallback.enabled:
+    st.warning(f"Fallback 사용 중: `{result.fallback.mode}`  |  {result.fallback.reason}")
+
+for w in result.warnings:
+    st.caption(f"- {w}")
 
 # ── KPI 카드 ───────────────────────────────────────────────────────────────────
 
 st.subheader("KPI")
-k1, k2, k3, k4 = st.columns(4)
-
-k1.metric(
-    label="평균 이용률",
-    value=f"{s.avg_utilization * 100:.1f}%",
-    help="전체 선로의 평균 이용률 (flow / capacity)",
-)
-k2.metric(
-    label="위험·과부하 선로",
-    value=f"{s.critical_count + s.overload_count}개",
-    delta=f"경고 {s.warning_count}개",
-    delta_color="off",
-)
-k3.metric(
-    label="총 추정 손실",
-    value=f"{s.total_loss_mw:.1f} MW",
-    help="선로 저항 손실 합계 (단순 모델)",
-)
-k4.metric(
-    label="최대 이용률",
-    value=f"{s.max_utilization * 100:.1f}%",
-    delta=f"선로 {s.max_utilization_line_id}",
-    delta_color="off",
-)
+kpi_cols = st.columns(len(result.kpis)) if result.kpis else []
+for col, kpi in zip(kpi_cols, result.kpis):
+    col.metric(kpi.label, _fmt_kpi_value(kpi), delta=_fmt_kpi_delta(kpi))
 
 st.divider()
 
@@ -98,75 +133,78 @@ st.divider()
 
 st.subheader("상태 요약")
 b1, b2, b3, b4 = st.columns(4)
-b1.metric("정상", f"{s.normal_count}개")
-b2.metric("경고", f"{s.warning_count}개")
-b3.metric("위험", f"{s.critical_count}개")
-b4.metric("과부하", f"{s.overload_count}개")
+b1.metric("정상", f"{cs.normal_count}개")
+b2.metric("경고", f"{cs.warning_count}개")
+b3.metric("위험", f"{cs.critical_count}개")
+b4.metric("과부하", f"{cs.overload_count}개")
 
 st.divider()
 
-# ── 차트 + 위험 선로 패널 ──────────────────────────────────────────────────────
+# ── 총부하 추세 차트 ───────────────────────────────────────────────────────────
+
+st.subheader("총부하 추세 (12h)")
+trend_df = pd.DataFrame(
+    [{"timestamp": p.timestamp, "total_load_mw": p.value} for p in result.trend_points]
+)
+if not trend_df.empty:
+    trend_fig = go.Figure(go.Scatter(
+        x=trend_df["timestamp"],
+        y=trend_df["total_load_mw"],
+        mode="lines+markers",
+        line={"width": 3, "color": "#1f77b4"},
+        marker={"size": 6},
+        hovertemplate="%{x|%H:%M}<br>%{y:,.0f} MW<extra></extra>",
+    ))
+    trend_fig.update_layout(
+        height=280,
+        margin={"t": 10, "b": 30, "l": 10, "r": 10},
+        xaxis_title="시각", yaxis_title="총부하 (MW)",
+        hovermode="x unified", plot_bgcolor="white",
+    )
+    st.plotly_chart(trend_fig, use_container_width=True)
+
+st.divider()
+
+# ── 선로별 이용률 차트 + 위험 선로 패널 ────────────────────────────────────────
 
 col_chart, col_danger = st.columns([3, 2])
 
 with col_chart:
     st.subheader("선로별 이용률")
-
     bar_x = [f"{l.from_bus_name}→{l.to_bus_name}" for l in lines]
     bar_y = [l.utilization * 100 for l in lines]
     bar_colors = [_STATUS_COLOR[l.status] for l in lines]
 
-    fig = go.Figure(
-        go.Bar(
-            x=bar_x,
-            y=bar_y,
-            marker_color=bar_colors,
-            text=[f"{v:.1f}%" for v in bar_y],
-            textposition="outside",
-            hovertemplate="%{x}<br>이용률: %{y:.1f}%<extra></extra>",
-        )
-    )
-    fig.add_hline(
-        y=70,
-        line_dash="dash",
-        line_color=_STATUS_COLOR["warning"],
-        annotation_text="경고 70%",
-        annotation_position="top right",
-    )
-    fig.add_hline(
-        y=90,
-        line_dash="dash",
-        line_color=_STATUS_COLOR["critical"],
-        annotation_text="위험 90%",
-        annotation_position="top right",
-    )
+    fig = go.Figure(go.Bar(
+        x=bar_x, y=bar_y, marker_color=bar_colors,
+        text=[f"{v:.1f}%" for v in bar_y], textposition="outside",
+        hovertemplate="%{x}<br>이용률: %{y:.1f}%<extra></extra>",
+    ))
+    fig.add_hline(y=70, line_dash="dash", line_color=_STATUS_COLOR["warning"],
+                  annotation_text="경고 70%", annotation_position="top right")
+    fig.add_hline(y=90, line_dash="dash", line_color=_STATUS_COLOR["critical"],
+                  annotation_text="위험 90%", annotation_position="top right")
     fig.update_layout(
-        yaxis_title="이용률 (%)",
-        yaxis_range=[0, max(bar_y) * 1.2 + 5],
-        xaxis_tickangle=-30,
-        height=420,
-        margin=dict(t=30, b=10, l=10, r=10),
-        plot_bgcolor="white",
+        yaxis_title="이용률 (%)", yaxis_range=[0, max(bar_y) * 1.2 + 5],
+        xaxis_tickangle=-30, height=400,
+        margin=dict(t=30, b=10, l=10, r=10), plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True)
 
 with col_danger:
     st.subheader("위험·경고 선로")
-
     danger_lines = sorted(
         [l for l in lines if l.status in ("overload", "critical", "warning")],
-        key=lambda l: l.utilization,
-        reverse=True,
+        key=lambda l: l.utilization, reverse=True,
     )
-
     if danger_lines:
         for l in danger_lines:
             color = {"warning": "orange", "critical": "red", "overload": "violet"}[l.status]
-            label = _STATUS_LABEL[l.status]
             st.markdown(
                 f":{color}[**[{l.line_id}] {l.from_bus_name} → {l.to_bus_name}**]  \n"
                 f"이용률 **{l.utilization * 100:.1f}%** &nbsp;|&nbsp; "
-                f"{l.flow_mw} MW / {l.capacity_mw:.0f} MW &nbsp;|&nbsp; :{color}[{label}]"
+                f"{l.flow_mw} MW / {l.capacity_mw:.0f} MW &nbsp;|&nbsp; "
+                f":{color}[{_STATUS_LABEL[l.status]}]"
             )
             st.divider()
     else:
@@ -175,7 +213,6 @@ with col_danger:
 # ── 전체 선로 상태표 ───────────────────────────────────────────────────────────
 
 st.subheader("전체 선로 상태표")
-
 rows = [
     {
         "선로 ID": l.line_id,
@@ -184,6 +221,7 @@ rows = [
         "용량 (MW)": l.capacity_mw,
         "이용률 (%)": round(l.utilization * 100, 1),
         "손실 (MW)": l.loss_mw,
+        "위험도": l.risk_level,
         "상태": _STATUS_LABEL[l.status],
     }
     for l in sorted(lines, key=lambda l: l.utilization, reverse=True)
@@ -204,6 +242,6 @@ st.dataframe(
 )
 
 st.caption(
-    f"기준 시각: {result.created_at.strftime('%Y-%m-%d %H:%M:%S')} | "
-    f"소스: {result.source} | 부하 배율: {result.load_scale:.2f}×"
+    f"기준 시각: {result.created_at:%Y-%m-%d %H:%M:%S}  |  "
+    f"소스: {result.source}  |  부하 배율: {result.load_scale:.2f}×"
 )

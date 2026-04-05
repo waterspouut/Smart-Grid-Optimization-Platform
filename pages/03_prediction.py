@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.data.schemas import PredictionResult, RiskLine
+from src.data.schemas import PredictionResult, ScenarioContext
 from src.services.prediction_service import PredictionService
 
 # ── 페이지 설정 ────────────────────────────────────────────────────────────────
@@ -38,6 +38,24 @@ _RISK_LABEL = {
     "medium":   "🟡 주의",
 }
 
+
+def _get_shared_scenario() -> ScenarioContext:
+    scenario = st.session_state.get("sgop_shared_scenario")
+    if isinstance(scenario, ScenarioContext):
+        return scenario
+
+    created_at = datetime.now().replace(minute=0, second=0, microsecond=0)
+    scenario = ScenarioContext(
+        scenario_id="sgop-demo-scenario",
+        title="SGOP Demo Scenario",
+        description="Monitoring, Simulation, Prediction이 공유하는 기본 시나리오",
+        region="South Korea",
+        created_at=created_at,
+        created_by="streamlit-session",
+    )
+    st.session_state.sgop_shared_scenario = scenario
+    return scenario
+
 # ── 사이드바 ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("예측 설정")
@@ -67,22 +85,44 @@ if "pred_scale" not in st.session_state:
     st.session_state.pred_scale = None
 
 # ── 예측 실행 (버튼 or 최초 진입) ─────────────────────────────────────────────
-if run_btn or st.session_state.pred_result is None:
+shared_scenario = _get_shared_scenario()
+cached_result = st.session_state.pred_result
+
+if (
+    run_btn
+    or cached_result is None
+    or cached_result.scenario is None
+    or cached_result.scenario.scenario_id != shared_scenario.scenario_id
+):
     with st.spinner("예측 계산 중..."):
         svc = PredictionService()
-        st.session_state.pred_result = svc.run_mock_prediction(load_scale=load_scale)
+        st.session_state.pred_result = svc.run_mock_prediction(
+            load_scale=load_scale,
+            scenario=shared_scenario,
+        )
         st.session_state.pred_scale = load_scale
 
 result: PredictionResult = st.session_state.pred_result
+if result.scenario is not None:
+    st.session_state.sgop_shared_scenario = result.scenario
 
 # ── 헤더 ──────────────────────────────────────────────────────────────────────
 st.title("📈 24시간 부하 예측")
+scenario_id = result.scenario.scenario_id if result.scenario is not None else result.scenario_id
 st.caption(
     f"기준 시각: {result.created_at:%Y-%m-%d %H:%M}  |  "
     f"소스: {result.source.upper()}  |  "
     f"부하 배율: {result.load_scale:.0%}  |  "
-    f"시나리오: {result.scenario_id}"
+    f"시나리오: {scenario_id}"
 )
+
+if result.fallback.enabled:
+    st.warning(
+        f"Fallback 사용 중: `{result.fallback.mode}`  |  {result.fallback.reason}"
+    )
+
+for warning in result.warnings:
+    st.caption(f"- {warning}")
 
 # ── 요약 배너 ─────────────────────────────────────────────────────────────────
 n_critical = sum(1 for r in result.risk_lines if r.risk_level == "critical")
@@ -181,7 +221,7 @@ else:
         height=420,
         margin={"t": 20, "b": 60},
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 st.divider()
 

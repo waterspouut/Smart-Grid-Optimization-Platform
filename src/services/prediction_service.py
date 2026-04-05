@@ -1,16 +1,17 @@
 # 예측 워크플로와 결과 처리 흐름을 조율한다.
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
 from src.data.schemas import (
+    FallbackInfo,
     HourlyLoadPrediction,
     PredictionResult,
     RiskLine,
+    ScenarioContext,
 )
 
 # ── 13-노드 정의 ───────────────────────────────────────────────────────────────
@@ -111,24 +112,28 @@ class PredictionService:
     def run_mock_prediction(
         self,
         load_scale: float = 1.0,
+        created_at: datetime | None = None,
         forecast_start: datetime | None = None,
+        scenario: ScenarioContext | None = None,
     ) -> PredictionResult:
         """합성 패턴 기반 24시간 예측 결과를 반환한다.
 
         Parameters
         ----------
         load_scale     : 부하 배율 (1.0 = 기본, 1.2 = 20% 증가)
-        forecast_start : 예측 기준 시각 (None 이면 현재 시각 사용)
+        created_at     : 공통 서비스 인터페이스 기준 시각
+        forecast_start : 기존 호출부 호환용 예측 기준 시각
         """
-        now = (forecast_start or datetime.now()).replace(
+        now = (created_at or forecast_start or datetime.now()).replace(
             minute=0, second=0, microsecond=0
         )
+        resolved_scenario = self._resolve_scenario(scenario, now)
         predictions = self._generate_predictions(now, load_scale)
         risk_lines = self._compute_risk_lines(predictions, load_scale)
         summary = self._build_summary(now, predictions, risk_lines)
 
         return PredictionResult(
-            scenario_id=str(uuid.uuid4())[:8],
+            scenario_id=resolved_scenario.scenario_id,
             created_at=now,
             load_scale=load_scale,
             forecast_horizon_h=24,
@@ -136,6 +141,15 @@ class PredictionService:
             risk_lines=risk_lines,
             summary=summary,
             source="mock",
+            scenario=resolved_scenario,
+            warnings=self._build_warnings(),
+            fallback=FallbackInfo(
+                enabled=True,
+                mode="mock_data",
+                reason="실제 예측 모델 대신 PredictionService의 mock 패턴 예측 결과를 사용합니다.",
+                primary_path="src.engine.forecast.feature_builder -> baseline/lstm forecaster",
+                active_path="src.services.prediction_service.PredictionService.run_mock_prediction",
+            ),
         )
 
     # ── 내부 ──────────────────────────────────────────────────────────────────
@@ -239,6 +253,31 @@ class PredictionService:
         if not risk_lines:
             parts.append("위험 선로 없음. 정상 운영 범위입니다.")
         return " ".join(parts)
+
+    def _resolve_scenario(
+        self,
+        scenario: ScenarioContext | None,
+        created_at: datetime,
+    ) -> ScenarioContext:
+        if scenario is not None:
+            if scenario.created_at is None:
+                scenario.created_at = created_at
+            return scenario
+
+        return ScenarioContext(
+            scenario_id="prediction-mock",
+            title="Prediction Mock Scenario",
+            description="예측 mock 서비스 기본 시나리오",
+            region="South Korea",
+            created_at=created_at,
+            created_by="PredictionService",
+        )
+
+    def _build_warnings(self) -> list[str]:
+        return [
+            "PredictionService는 현재 `mock_data` fallback 결과를 반환합니다.",
+            "실제 baseline/LSTM 모델이 연결되기 전까지 합성 패턴 기반 예측을 사용합니다.",
+        ]
 
 
 # ── 순수 함수 ──────────────────────────────────────────────────────────────────
