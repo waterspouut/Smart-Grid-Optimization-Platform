@@ -88,17 +88,37 @@ with st.sidebar:
         help="전체 부하의 배율. 1.3 이상이면 위험·과부하 선로가 늘어납니다.",
     )
     st.divider()
+    data_source = st.radio(
+        "데이터 소스",
+        options=["mock", "DC Power Flow"],
+        index=0,
+        help="mock: 고정 합성 데이터 (빠름) / DC Power Flow: 선형 조류 계산 (실제 물리 모델)",
+    )
+    st.divider()
     if st.button("새로고침", use_container_width=True):
         st.cache_data.clear()
-    st.caption("데이터 소스: mock (1주차)")
+    st.caption(f"데이터 소스: {data_source} (2주차)")
+
+# ── 입력 검증 ──────────────────────────────────────────────────────────────────
+
+if load_scale >= 1.4:
+    st.warning(f"부하 배율 {load_scale:.2f}×: 과부하 상태가 예상됩니다. 실제 운영 상황을 확인하세요.")
+elif load_scale <= 0.6:
+    st.info(f"부하 배율 {load_scale:.2f}×: 경부하 상태입니다.")
 
 # ── 데이터 로드 ────────────────────────────────────────────────────────────────
 
 with st.spinner("모니터링 결과를 생성하는 중입니다..."):
-    result: MonitoringResult = service.run_mock_monitoring(
-        scenario=_get_shared_scenario(),
-        load_scale=load_scale,
-    )
+    if data_source == "DC Power Flow":
+        result: MonitoringResult = service.run_dc_power_flow(
+            scenario=_get_shared_scenario(),
+            load_scale=load_scale,
+        )
+    else:
+        result: MonitoringResult = service.run_mock_monitoring(
+            scenario=_get_shared_scenario(),
+            load_scale=load_scale,
+        )
 
 st.session_state.sgop_shared_scenario = result.scenario
 cs = result.congestion_summary

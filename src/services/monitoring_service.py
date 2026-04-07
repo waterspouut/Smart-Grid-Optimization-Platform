@@ -14,6 +14,11 @@ from src.data.schemas import (
     ScenarioContext,
     TimeSeriesPoint,
 )
+from src.engine.powerflow import dc_power_flow as _dcpf
+from src.engine.powerflow.congestion_metrics import (
+    compute_congestion_summary,
+    compute_line_statuses,
+)
 
 # ── 한국 345kV 주요 버스 (13개) ────────────────────────────────────────────────
 # (bus_id, 이름)
@@ -291,6 +296,74 @@ class MonitoringService:
                 active_path="src.services.monitoring_service.MonitoringService.run_mock_monitoring",
             ),
         )
+
+    def run_dc_power_flow(
+        self,
+        scenario: ScenarioContext | None = None,
+        load_scale: float = 1.0,
+        *,
+        created_at: datetime | None = None,
+    ) -> MonitoringResult:
+        """DC Power Flow 계산으로 MonitoringResult 를 생성한다.
+
+        DC 계산이 실패하면 자동으로 run_mock_monitoring() 으로 fallback 한다.
+
+        Parameters
+        ----------
+        scenario:
+            공유 시나리오 컨텍스트. None 이면 기본 시나리오를 생성한다.
+        load_scale:
+            전체 부하 배율. 1.0 = 기준 부하.
+        created_at:
+            결과 기준 시각. None 이면 현재 시각을 사용한다.
+        """
+        now = _round_to_hour(created_at or datetime.now())
+        resolved_scenario = self._resolve_scenario(scenario, now)
+
+        try:
+            buses = _dcpf.build_default_buses(load_scale)
+            lines = _dcpf.build_default_line_inputs()
+            dc_result = _dcpf.solve(buses, lines)
+
+            if not dc_result.converged:
+                raise RuntimeError(dc_result.error)
+
+            line_statuses = compute_line_statuses(dc_result)
+            cs = compute_congestion_summary(line_statuses)
+            trend = _build_trend_points(load_scale, now)
+
+            return MonitoringResult(
+                scenario=resolved_scenario,
+                created_at=now,
+                source="dc_power_flow",
+                load_scale=load_scale,
+                line_statuses=line_statuses,
+                congestion_summary=cs,
+                kpis=_build_kpis(cs, trend),
+                trend_points=trend,
+                summary=_build_summary_text(cs, line_statuses),
+                warnings=["DC Power Flow 결과입니다."],
+                fallback=FallbackInfo(enabled=False, mode="none"),
+            )
+
+        except Exception as exc:  # noqa: BLE001
+            fallback_result = self.run_mock_monitoring(
+                scenario=resolved_scenario,
+                load_scale=load_scale,
+                created_at=created_at,
+            )
+            fallback_result.warnings.insert(
+                0,
+                f"DC Power Flow 실패 → mock fallback 전환. 원인: {exc}",
+            )
+            fallback_result.fallback = FallbackInfo(
+                enabled=True,
+                mode="mock_data",
+                reason=str(exc),
+                primary_path="src.engine.powerflow.dc_power_flow.solve",
+                active_path="src.services.monitoring_service.MonitoringService.run_mock_monitoring",
+            )
+            return fallback_result
 
     def get_monitoring_result(
         self,
