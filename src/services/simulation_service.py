@@ -13,10 +13,18 @@ from src.data.schemas import (
     SimulationInput,
     SimulationResult,
 )
-from src.engine.search.astar_router import BusNodeSpec, RouteCandidateSpec, build_mock_route
+from src.engine.search.astar_router import (
+    BusNodeSpec,
+    GraphEdgeSpec,
+    RouteCandidateSpec,
+    build_astar_route,
+    build_k_nearest_edges,
+    build_mock_route,
+)
 from src.engine.search.score_function import (
     CandidateScoreInput,
     build_recommendation,
+    calculate_score,
     calculate_mock_score,
     rank_recommendations,
 )
@@ -147,6 +155,70 @@ class SimulationService:
             ),
         )
 
+    def run_simulation(
+        self,
+        simulation_input: SimulationInput | None = None,
+        *,
+        created_at: datetime | None = None,
+    ) -> SimulationResult:
+        """2주차용 실제 A* + 점수화 v1 진입점.
+
+        설치 전후 delta는 아직 mock 규칙을 유지하므로 partial fallback 메타데이터를 남긴다.
+        """
+
+        resolved_at = _round_to_hour(created_at or datetime.now())
+        resolved_input, input_warnings = self._normalize_input(simulation_input, resolved_at)
+
+        try:
+            recommendations = self._build_recommendations_v1(resolved_input)
+            selected_route = recommendations[0].route if recommendations else None
+            deltas = self._build_mock_deltas(
+                resolved_input,
+                recommendations[0] if recommendations else None,
+            )
+
+            warnings = input_warnings + [
+                "SimulationService는 현재 `mock_data` fallback 결과를 반환합니다.",
+                "경로 탐색과 점수화는 A* v1을 사용하고, 설치 전후 비교 delta는 mock 규칙을 사용합니다.",
+            ]
+
+            return SimulationResult(
+                scenario=resolved_input.scenario,
+                created_at=resolved_at,
+                source="astar",
+                simulation_input=resolved_input,
+                selected_route=selected_route,
+                recommendations=recommendations,
+                deltas=deltas,
+                summary=self._build_summary(resolved_input, recommendations, deltas),
+                warnings=warnings,
+                fallback=FallbackInfo(
+                    enabled=True,
+                    mode="mock_data",
+                    reason="설치 전후 비교 delta는 아직 실제 power flow 대신 mock 규칙을 사용합니다.",
+                    primary_path="src.engine.powerflow.dc_power_flow -> src.engine.powerflow.congestion_metrics",
+                    active_path="src.services.simulation_service.SimulationService._build_mock_deltas",
+                ),
+            )
+
+        except Exception as exc:  # noqa: BLE001
+            fallback_result = self.run_mock_simulation(
+                simulation_input=resolved_input,
+                created_at=resolved_at,
+            )
+            fallback_result.warnings.insert(
+                0,
+                f"A* route/score 실패 → mock fallback 전환. 원인: {exc}",
+            )
+            fallback_result.fallback = FallbackInfo(
+                enabled=True,
+                mode="mock_data",
+                reason=str(exc),
+                primary_path="src.engine.search.astar_router.build_astar_route -> src.engine.search.score_function.calculate_score",
+                active_path="src.services.simulation_service.SimulationService.run_mock_simulation",
+            )
+            return fallback_result
+
     def _resolve_scenario(
         self,
         scenario: ScenarioContext | None,
@@ -232,6 +304,54 @@ class SimulationService:
                     policy_risk=float(candidate["policy_risk"]),
                     load_scale=simulation_input.load_scale,
                 )
+            )
+            scored_recommendations.append(
+                build_recommendation(
+                    candidate_id=candidate_id,
+                    candidate_label=str(candidate["label"]),
+                    route=route,
+                    score=score,
+                    rationale=self._build_rationale(simulation_input, candidate, score),
+                )
+            )
+
+        return rank_recommendations(scored_recommendations)
+
+    def _build_recommendations_v1(
+        self,
+        simulation_input: SimulationInput,
+    ) -> list[RecommendationResult]:
+        scored_recommendations: list[RecommendationResult] = []
+        bus_nodes = self._build_bus_nodes()
+        bus_edges = self._build_bus_edges(bus_nodes)
+        start_bus = _to_bus_node_spec(simulation_input.start_bus_id)
+        end_bus = _to_bus_node_spec(simulation_input.end_bus_id)
+        hub_bus_id = "BUS_007" if simulation_input.end_bus_id != "BUS_007" else "BUS_010"
+        hub_bus = _to_bus_node_spec(hub_bus_id)
+
+        for index, candidate_id in enumerate(simulation_input.candidate_site_ids):
+            candidate = _get_candidate(candidate_id, index)
+            route = build_astar_route(
+                start_bus=start_bus,
+                end_bus=end_bus,
+                candidate=_to_route_candidate_spec(candidate_id, candidate),
+                bus_nodes=bus_nodes,
+                edges=bus_edges,
+                via_bus=hub_bus,
+                load_scale=simulation_input.load_scale,
+            )
+            score = calculate_score(
+                CandidateScoreInput(
+                    candidate_id=candidate_id,
+                    candidate_label=str(candidate["label"]),
+                    distance_km=float(candidate["distance_km"]),
+                    construction_cost=float(candidate["construction_cost"]),
+                    congestion_relief=float(candidate["congestion_relief"]),
+                    environmental_risk=float(candidate["environmental_risk"]),
+                    policy_risk=float(candidate["policy_risk"]),
+                    load_scale=simulation_input.load_scale,
+                ),
+                route=route,
             )
             scored_recommendations.append(
                 build_recommendation(
@@ -353,6 +473,18 @@ class SimulationService:
             f"예상 경로 길이 {top_recommendation.route.total_distance_km:.1f}km입니다."
             f"{utilization_text}"
         )
+
+    def _build_bus_nodes(self) -> list[BusNodeSpec]:
+        return [
+            _to_bus_node_spec(bus_id)
+            for bus_id in _BUS_METADATA
+        ]
+
+    def _build_bus_edges(
+        self,
+        bus_nodes: list[BusNodeSpec],
+    ) -> list[GraphEdgeSpec]:
+        return build_k_nearest_edges(bus_nodes, neighbor_count=3)
 
 
 def _round_to_hour(value: datetime) -> datetime:
