@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 
 from src.data.schemas import (
     CongestionSummary,
-    FallbackInfo,
     LineStatus,
     MonitoringKpi,
     MonitoringResult,
@@ -18,6 +17,12 @@ from src.engine.powerflow import dc_power_flow as _dcpf
 from src.engine.powerflow.congestion_metrics import (
     compute_congestion_summary,
     compute_line_statuses,
+)
+from src.services.result_metadata import (
+    build_fallback_info,
+    build_fallback_warning,
+    build_no_fallback_info,
+    build_source_warning,
 )
 
 # ── 한국 345kV 주요 버스 (13개) ────────────────────────────────────────────────
@@ -214,7 +219,7 @@ def _build_summary_text(cs: CongestionSummary, lines: list[LineStatus]) -> str:
 
 
 def _build_warnings(lines: list[LineStatus]) -> list[str]:
-    warnings = ["MonitoringService는 현재 mock_data fallback 결과를 반환합니다."]
+    warnings = [build_fallback_warning("MonitoringService", "mock_data")]
     critical = [l.line_id for l in lines if l.risk_level == "critical"]
     high = [l.line_id for l in lines if l.risk_level == "high"]
     if critical:
@@ -288,8 +293,7 @@ class MonitoringService:
             trend_points=trend,
             summary=_build_summary_text(cs, lines),
             warnings=_build_warnings(lines),
-            fallback=FallbackInfo(
-                enabled=True,
+            fallback=build_fallback_info(
                 mode="mock_data",
                 reason="실제 dc_power_flow 엔진 대신 mock 결과를 사용합니다.",
                 primary_path="src.engine.powerflow.dc_power_flow",
@@ -342,8 +346,8 @@ class MonitoringService:
                 kpis=_build_kpis(cs, trend),
                 trend_points=trend,
                 summary=_build_summary_text(cs, line_statuses),
-                warnings=["DC Power Flow 결과입니다."],
-                fallback=FallbackInfo(enabled=False, mode="none"),
+                warnings=[build_source_warning("MonitoringService", "dc_power_flow")],
+                fallback=build_no_fallback_info(),
             )
 
         except Exception as exc:  # noqa: BLE001
@@ -356,8 +360,7 @@ class MonitoringService:
                 0,
                 f"DC Power Flow 실패 → mock fallback 전환. 원인: {exc}",
             )
-            fallback_result.fallback = FallbackInfo(
-                enabled=True,
+            fallback_result.fallback = build_fallback_info(
                 mode="mock_data",
                 reason=str(exc),
                 primary_path="src.engine.powerflow.dc_power_flow.solve",

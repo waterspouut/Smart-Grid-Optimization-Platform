@@ -7,11 +7,14 @@ import numpy as np
 import pandas as pd
 
 from src.data.schemas import (
-    FallbackInfo,
     HourlyLoadPrediction,
     PredictionResult,
     RiskLine,
     ScenarioContext,
+)
+from src.services.result_metadata import (
+    build_fallback_info,
+    build_fallback_warning,
 )
 
 # ── 13-노드 정의 ───────────────────────────────────────────────────────────────
@@ -143,8 +146,7 @@ class PredictionService:
             source="mock",
             scenario=resolved_scenario,
             warnings=self._build_warnings(),
-            fallback=FallbackInfo(
-                enabled=True,
+            fallback=build_fallback_info(
                 mode="mock_data",
                 reason="실제 예측 모델 대신 PredictionService의 mock 패턴 예측 결과를 사용합니다.",
                 primary_path="src.engine.forecast.feature_builder -> baseline/lstm forecaster",
@@ -275,7 +277,7 @@ class PredictionService:
 
     def _build_warnings(self) -> list[str]:
         return [
-            "PredictionService는 현재 `mock_data` fallback 결과를 반환합니다.",
+            build_fallback_warning("PredictionService", "mock_data"),
             "실제 baseline/LSTM 모델이 연결되기 전까지 합성 패턴 기반 예측을 사용합니다.",
         ]
 

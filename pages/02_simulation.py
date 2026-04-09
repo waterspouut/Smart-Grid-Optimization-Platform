@@ -102,7 +102,7 @@ simulation_input = SimulationInput(
 )
 
 with st.spinner("시뮬레이션 결과를 생성하는 중입니다..."):
-    result: SimulationResult = service.run_mock_simulation(simulation_input)
+    result: SimulationResult = service.run_simulation(simulation_input)
 
 st.session_state.sgop_shared_scenario = result.scenario
 

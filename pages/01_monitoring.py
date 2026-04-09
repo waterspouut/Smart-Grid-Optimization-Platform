@@ -248,16 +248,9 @@ rows = [
 ]
 df = pd.DataFrame(rows)
 
-
-def _color_status(val: str) -> str:
-    reverse = {v: k for k, v in _STATUS_LABEL.items()}
-    bg = _STATUS_BG.get(reverse.get(val, ""), "")
-    return f"background-color: {bg}" if bg else ""
-
-
 st.dataframe(
-    df.style.applymap(_color_status, subset=["상태"]),
-    use_container_width=True,
+    df,
+    width="stretch",
     hide_index=True,
 )
 
