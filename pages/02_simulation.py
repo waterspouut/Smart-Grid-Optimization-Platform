@@ -1,250 +1,142 @@
 from __future__ import annotations
-from datetime import datetime
-import pandas as pd
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
 
-# 오름님이 만든 엔진 모듈 임포트
+# 오름님의 엔진 및 서비스 모듈 임포트
 from src.engine.powerflow.dc_power_flow import solve, build_default_buses, build_default_line_inputs
+from src.services.simulation_service import SimulationService
 
 st.set_page_config(page_title="시뮬레이션 | SGOP", layout="wide")
 
-<<<<<<< Updated upstream
-st.set_page_config(
-    page_title="시뮬레이션 | SGOP",
-    page_icon="🗺️",
-    layout="wide",
-)
+# --- 1. 서비스 초기화 ---
+sim_service = SimulationService()
+bus_options = sim_service.list_bus_options()
+candidate_options = sim_service.list_candidate_options()
 
-
-def _get_shared_scenario() -> ScenarioContext:
-    scenario = st.session_state.get("sgop_shared_scenario")
-    if isinstance(scenario, ScenarioContext):
-        return scenario
-
-    created_at = datetime.now().replace(minute=0, second=0, microsecond=0)
-    scenario = ScenarioContext(
-        scenario_id="sgop-demo-scenario",
-        title="SGOP Demo Scenario",
-        description="Monitoring과 Simulation이 공유하는 기본 시나리오",
-        region="South Korea",
-        created_at=created_at,
-        created_by="streamlit-session",
-    )
-    st.session_state.sgop_shared_scenario = scenario
-    return scenario
-
-
-service = SimulationService()
-bus_options = service.list_bus_options()
-candidate_options = service.list_candidate_options()
-bus_ids = [bus_id for bus_id, _ in bus_options]
-candidate_ids = [candidate_id for candidate_id, _ in candidate_options]
-bus_labels = {bus_id: f"{name} ({bus_id})" for bus_id, name in bus_options}
-candidate_labels = {
-    candidate_id: f"{label} ({candidate_id})"
-    for candidate_id, label in candidate_options
-}
-
-with st.sidebar:
-    st.header("시뮬레이션 입력")
-    start_bus_id = st.selectbox(
-        "시작 버스",
-        options=bus_ids,
-        index=bus_ids.index("BUS_001"),
-        format_func=lambda bus_id: bus_labels[bus_id],
-    )
-    end_bus_id = st.selectbox(
-        "종료 버스",
-        options=bus_ids,
-        index=bus_ids.index("BUS_011"),
-        format_func=lambda bus_id: bus_labels[bus_id],
-    )
-    candidate_site_ids = st.multiselect(
-        "후보지",
-        options=candidate_ids,
-        default=candidate_ids,
-        format_func=lambda candidate_id: candidate_labels[candidate_id],
-    )
-    load_scale = st.slider(
-        "부하 배율",
-        min_value=0.80,
-        max_value=1.30,
-        value=1.00,
-        step=0.05,
-    )
-    notes = st.text_area(
-        "시나리오 메모",
-        value="주요 혼잡 구간 우회와 운영 여유도 확보를 목표로 한 mock 시뮬레이션",
-        height=120,
-    )
-    st.caption("페이지는 SimulationService 입력/출력 계약만 사용합니다.")
-
-
-st.title("🗺️ 송전탑 설치 시뮬레이션")
-
-if start_bus_id == end_bus_id:
-    st.error("시작 버스와 종료 버스는 다르게 선택해야 합니다.")
-    st.stop()
-
-if not candidate_site_ids:
-    st.error("후보지는 1개 이상 선택해야 합니다.")
-    st.stop()
-
-simulation_input = SimulationInput(
-    scenario=_get_shared_scenario(),
-    start_bus_id=start_bus_id,
-    end_bus_id=end_bus_id,
-    candidate_site_ids=candidate_site_ids,
-    load_scale=load_scale,
-    notes=notes,
-)
-
-with st.spinner("시뮬레이션 결과를 생성하는 중입니다..."):
-    result: SimulationResult = service.run_simulation(simulation_input)
-
-st.session_state.sgop_shared_scenario = result.scenario
-
-st.caption(
-    f"기준 시각: {result.created_at:%Y-%m-%d %H:%M}  |  "
-    f"소스: {result.source.upper()}  |  "
-    f"시나리오: {result.scenario.scenario_id}"
-)
-st.info(result.summary)
-
-if result.fallback.enabled:
-    st.warning(
-        f"Fallback 사용 중: `{result.fallback.mode}`  |  {result.fallback.reason}"
-    )
-
-for warning in result.warnings:
-    st.caption(f"- {warning}")
-
-top_recommendation = result.recommendations[0] if result.recommendations else None
-peak_delta = next(
-    (delta for delta in result.deltas if delta.metric_id == "peak_utilization"),
-    None,
-)
-
-metric_cols = st.columns(4)
-metric_cols[0].metric(
-    "1순위 후보",
-    top_recommendation.candidate_label if top_recommendation else "-",
-)
-metric_cols[1].metric(
-    "추천 총점",
-    f"{top_recommendation.score.total_score:.1f}"
-    if top_recommendation and top_recommendation.score
-    else "-",
-)
-metric_cols[2].metric(
-    "적용 경로 길이",
-    f"{top_recommendation.route.total_distance_km:.1f} km"
-    if top_recommendation and top_recommendation.route
-    else "-",
-)
-metric_cols[3].metric(
-    "최대 이용률 개선",
-    f"{peak_delta.improvement:.1f}%p" if peak_delta else "-",
-)
-
-st.divider()
-col_left, col_right = st.columns([1.1, 1.2])
-
-with col_left:
-    st.subheader("🗺️ 선정 경로 (지도 시각화)")
-=======
-# --- 1. 혼잡도에 따른 색상 결정 함수 (나현님 파트) ---
 def get_congestion_color(flow_mw, capacity_mw):
-    """흐름량과 용량을 비교해 색상을 반환합니다."""
-    if capacity_mw <= 0: return "#9ca3af" # 용량 정보 없음
->>>>>>> Stashed changes
-    
-    # 혼잡도 계산 (%)
+    if capacity_mw <= 0: return "#9ca3af"
     congestion = (abs(flow_mw) / capacity_mw) * 100
-    
-    if congestion >= 80:
-        return "#ef4444"  # 빨간색 (80% 이상: 위험)
-    elif congestion >= 50:
-        return "#eab308"  # 노란색 (50~80%: 주의)
-    else:
-        return "#22c55e"  # 초록색 (50% 미만: 원활)
+    if congestion >= 80: return "#ef4444"  # 빨강
+    elif congestion >= 50: return "#eab308" # 노랑
+    else: return "#22c55e" # 초록
 
-# --- 2. 사이드바 입력창 ---
+# --- 2. 사이드바 입력창 (SimulationService 연동) ---
 with st.sidebar:
     st.header("⚡ 시뮬레이션 제어")
+    start_bus = st.selectbox("시작 버스", options=[b[0] for b in bus_options], format_func=lambda x: dict(bus_options)[x], index=0)
+    end_bus = st.selectbox("종료 버스", options=[b[0] for b in bus_options], format_func=lambda x: dict(bus_options)[x], index=10)
+    
+    selected_candidates = st.multiselect(
+        "경유 후보지 선택", 
+        options=[c[0] for c in candidate_options],
+        default=[c[0] for c in candidate_options],
+        format_func=lambda x: dict(candidate_options)[x]
+    )
+    
     load_scale = st.slider("시스템 전체 부하 배율", 0.5, 1.5, 1.0, 0.05)
-    st.caption("부하를 높이면 선로 혼잡도가 실시간으로 계산됩니다.")
 
-st.title("🗺️ 송전망 혼잡도 실시간 시뮬레이션")
+st.title("🗺️ 송전망 혼잡도 및 A* 최적 경로 시뮬레이션")
 
-# --- 3. 엔진 가동 (박차오름님 파트 호출) ---
-# 기본 버스와 선로 데이터를 가져와서 실제 전력 흐름을 계산합니다.
+# --- 3. 엔진 및 시뮬레이션 가동 ---
 buses = build_default_buses(load_scale=load_scale)
 lines = build_default_line_inputs()
-result = solve(buses, lines)
+pf_result = solve(buses, lines)
 
-if not result.converged:
-    st.error(f"계산 실패: {result.error}")
-    st.stop()
+sim_input = sim_service.build_default_input(
+    start_bus_id=start_bus, 
+    end_bus_id=end_bus, 
+    candidate_site_ids=selected_candidates, 
+    load_scale=load_scale
+)
+sim_result = sim_service.run_simulation(sim_input)
 
-# --- 4. 메인 화면 레이아웃 ---
+# --- 4. 화면 레이아웃 (지도 & 지표) ---
 col_map, col_info = st.columns([2, 1])
 
 with col_map:
-    st.subheader("📍 실시간 계통 혼잡 지도")
+    st.subheader("📍 A* 최적 경로 및 계통 혼잡 지도")
+    m = folium.Map(location=[36.5, 127.5], zoom_start=7, tiles='CartoDB positron')
     
-    # 지도 초기 위치 (서울 중심)
-    m = folium.Map(location=[37.5665, 126.9780], zoom_start=10, tiles='CartoDB positron')
-    
-    # 노드(Bus) 정보를 사전 형태로 변환 (위치 찾기용)
-    # 실제 프로젝트에서는 DB나 다른 스키마에서 위경도를 가져와야 합니다.
-    # 여기서는 예시 좌표를 사용합니다.
     bus_coords = {
-        "B01": [37.78, 127.48], "B02": [37.85, 127.05], "B03": [37.24, 127.17],
-        "B04": [37.01, 127.21], "B05": [36.93, 126.88], "B06": [37.55, 127.12],
-        "B07": [37.36, 127.11], "B08": [37.54, 127.18], "B09": [37.26, 127.02],
-        "B10": [37.38, 126.81], "B11": [37.52, 126.65], "B12": [37.49, 127.05],
-        "B13": [37.60, 127.03]
+        "BUS_001": [37.5665, 126.9780], "BUS_002": [37.4563, 126.7052], 
+        "BUS_003": [37.2636, 127.0286], "BUS_004": [37.8813, 127.7298],
+        "BUS_005": [37.7519, 128.8761], "BUS_006": [37.3422, 127.9202],
+        "BUS_007": [36.3504, 127.3845], "BUS_008": [36.6424, 127.4890],
+        "BUS_009": [35.1595, 126.8526], "BUS_010": [35.8242, 127.1480],
+        "BUS_011": [35.8714, 128.6014], "BUS_012": [35.5384, 129.3114],
+        "BUS_013": [35.1796, 129.0756]
     }
 
-    # 선로(Line) 그리기 및 색상 입히기
+    # 1. 기존 혼잡망 그리기 (선 살려내기 코드 적용 완료!)
     for line in lines:
-        if line.from_bus in bus_coords and line.to_bus in bus_coords:
-            start_pos = bus_coords[line.from_bus]
-            end_pos = bus_coords[line.to_bus]
-            
-            # 엔진 결과에서 현재 선로의 흐름량(MW) 가져오기
-            current_flow = result.line_flows.get(line.line_id, 0)
-            # 혼잡도 색상 결정
-            line_color = get_congestion_color(current_flow, line.capacity_mw)
-            
-            # 지도에 선 그리기
+        f_num = line.from_bus.replace('B', '')
+        t_num = line.to_bus.replace('B', '')
+        f_bus = f"BUS_{f_num.zfill(3)}"
+        t_bus = f"BUS_{t_num.zfill(3)}"
+        
+        if f_bus in bus_coords and t_bus in bus_coords:
+            current_flow = pf_result.line_flows.get(line.line_id, 0)
             folium.PolyLine(
-                locations=[start_pos, end_pos],
-                color=line_color,
-                weight=5,
-                opacity=0.8,
-                tooltip=f"선로: {line.line_id} | 흐름: {abs(current_flow)}MW / {line.capacity_mw}MW"
+                locations=[bus_coords[f_bus], bus_coords[t_bus]],
+                color=get_congestion_color(current_flow, line.capacity_mw),
+                weight=4, opacity=0.4
             ).add_to(m)
 
-    st_folium(m, width="100%", height=500, returned_objects=[])
+    # 2. 신규 A* 최적 경로 그리기 (파란색 점선)
+    if sim_result.selected_route and sim_result.selected_route.waypoints:
+        route_coords = [[wp.latitude, wp.longitude] for wp in sim_result.selected_route.waypoints]
+        
+        folium.PolyLine(
+            locations=route_coords,
+            color="#2563eb",
+            weight=5,
+            dash_array="10",
+            tooltip="추천 A* 신규 송전 경로",
+            opacity=0.9
+        ).add_to(m)
+        
+        for wp in sim_result.selected_route.waypoints:
+            folium.CircleMarker(
+                location=[wp.latitude, wp.longitude],
+                radius=6, popup=wp.label, tooltip=wp.label,
+                color="#2563eb", fill=True, fill_color="#ffffff", fill_opacity=1.0
+            ).add_to(m)
+        
+    # 3. 지도 왼쪽 아래에 범례(Legend) 박스 추가하기
+    legend_html = '''
+    <div style="position: fixed; 
+         bottom: 30px; left: 30px; width: 170px; height: 135px; 
+         background-color: rgba(255, 255, 255, 0.95); z-index:9999; font-size:13px;
+         border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px;
+         box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
+         <div style="font-weight: bold; margin-bottom: 5px;">🚥 선로 상태 범례</div>
+         <div style="margin-bottom: 2px;"><span style="color:#22c55e; font-size:16px;">■</span> 원활 (50% 미만)</div>
+         <div style="margin-bottom: 2px;"><span style="color:#eab308; font-size:16px;">■</span> 주의 (50~80%)</div>
+         <div style="margin-bottom: 2px;"><span style="color:#ef4444; font-size:16px;">■</span> 혼잡 (80% 이상)</div>
+         <div><span style="color:#2563eb; font-weight:bold; font-size:16px;">╍</span> 신규 A* 경로</div>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    st_folium(m, width="100%", height=550, returned_objects=[])
 
 with col_info:
-    st.subheader("📊 주요 지표")
+    # --- 5. 설치 전/후 비교 카드 UI ---
+    st.subheader("📊 설치 전/후 비교 (Deltas)")
     
-    # 가장 혼잡한 선로 찾기
-    max_line_id = max(result.line_flows, key=lambda k: abs(result.line_flows[k]))
-    max_flow = abs(result.line_flows[max_line_id])
-    
-    # 현재 부하 상태 표시
-    st.metric("전체 부하 배율", f"{load_scale:.2f}x")
-    st.metric("최대 조류 선로", f"{max_line_id}", f"{max_flow} MW")
-    
-    st.divider()
-    st.write("**💡 분석 리포트**")
-    if load_scale > 1.2:
-        st.warning("⚠️ 부하가 높아 일부 구간에 병목 현상이 발생하고 있습니다. 신규 송전탑 설치 제안이 필요합니다.")
+    if sim_result.deltas:
+        for delta in sim_result.deltas:
+            delta_color = "normal" if delta.status != "worsened" else "inverse"
+            st.metric(
+                label=delta.label,
+                value=f"{delta.after_value} {delta.unit}",
+                delta=f"{delta.improvement} {delta.unit} ({'개선' if delta.improvement > 0 else '증가'})",
+                delta_color=delta_color
+            )
     else:
-        st.success("✅ 현재 계통은 안정적인 상태입니다.")
+        st.info("비교할 데이터가 없습니다.")
+        
+    st.divider()
+    st.write("**💡 종합 요약**")
+    st.success(sim_result.summary)
