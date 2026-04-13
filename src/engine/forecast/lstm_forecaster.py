@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.data.schemas import HourlyLoadPrediction
+from src.data.schemas import ForecastFeatureVector, HourlyLoadPrediction
 
 _MODEL_DIR = Path(__file__).resolve().parents[3] / "models" / "lstm"
 _MODEL_PATH = _MODEL_DIR / "model.keras"
@@ -61,6 +61,18 @@ def _build_windows(
         X.append(np.hstack([x_load, x_time, x_temp]))
         y.append(load_norm[i + LOOKBACK_H: i + LOOKBACK_H + HORIZON_H])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+def _group_target_features(
+    target_features: list[ForecastFeatureVector],
+) -> dict[str, list[ForecastFeatureVector]]:
+    grouped: dict[str, list[ForecastFeatureVector]] = {}
+    for feature in target_features:
+        grouped.setdefault(feature.bus_id, []).append(feature)
+
+    for bus_features in grouped.values():
+        bus_features.sort(key=lambda feature: feature.timestamp)
+    return grouped
 
 
 class LSTMForecaster:
@@ -214,6 +226,7 @@ class LSTMForecaster:
         history_df: pd.DataFrame,
         forecast_start: datetime,
         horizon_h: int = HORIZON_H,
+        target_features: list[ForecastFeatureVector] | None = None,
     ) -> list[HourlyLoadPrediction]:
         """forecast_start 이전 24h 이력으로 다음 horizon_h 시간을 예측한다."""
         self._load_if_needed()
@@ -221,11 +234,24 @@ class LSTMForecaster:
         df = history_df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-        results: list[HourlyLoadPrediction] = []
+        targets_by_bus: dict[str, list[ForecastFeatureVector]] = {}
+        if target_features is not None:
+            targets_by_bus = _group_target_features(target_features)
+            unknown_bus_ids = sorted(set(targets_by_bus) - set(self._bus_ids))
+            if unknown_bus_ids:
+                raise ValueError(
+                    f"target_features에 학습되지 않은 bus_id가 포함되어 있습니다: {unknown_bus_ids}"
+                )
+
+        prediction_map: dict[tuple[datetime, str], HourlyLoadPrediction] = {}
         window_end   = forecast_start - timedelta(hours=1)
         window_start = forecast_start - timedelta(hours=LOOKBACK_H)
 
         for bus_id in self._bus_ids:
+            bus_target_features = targets_by_bus.get(bus_id)
+            if target_features is not None and not bus_target_features:
+                continue
+
             bus_df = (
                 df[df["bus_id"] == bus_id]
                 .set_index("timestamp")
@@ -259,18 +285,39 @@ class LSTMForecaster:
             pred_norm = self._model.predict(X, verbose=0)[0]
             pred_mw = scaler.inverse_transform(pred_norm.reshape(-1, 1)).flatten()
 
-            for h, mw in enumerate(pred_mw[:horizon_h], start=1):
+            if bus_target_features is not None:
+                target_timestamps = [
+                    feature.timestamp
+                    for feature in bus_target_features[:horizon_h]
+                ]
+            else:
+                target_timestamps = [
+                    forecast_start + timedelta(hours=h)
+                    for h in range(1, horizon_h + 1)
+                ]
+
+            for ts, mw in zip(target_timestamps, pred_mw[: len(target_timestamps)]):
                 mw = float(max(0.0, mw))
                 ci = mw * 0.06
-                results.append(HourlyLoadPrediction(
-                    timestamp=forecast_start + timedelta(hours=h),
+                prediction_map[(ts, bus_id)] = HourlyLoadPrediction(
+                    timestamp=ts,
                     bus_id=bus_id,
                     predicted_load_mw=round(mw, 1),
                     confidence_lower_mw=round(max(0.0, mw - ci), 1),
                     confidence_upper_mw=round(mw + ci, 1),
-                ))
+                )
 
-        return results
+        if target_features is None:
+            return sorted(
+                prediction_map.values(),
+                key=lambda item: (item.timestamp, item.bus_id),
+            )
+
+        return [
+            prediction_map[(feature.timestamp, feature.bus_id)]
+            for feature in target_features
+            if (feature.timestamp, feature.bus_id) in prediction_map
+        ]
 
     def is_trained(self) -> bool:
         return _MODEL_PATH.exists() and _SCALER_PATH.exists()

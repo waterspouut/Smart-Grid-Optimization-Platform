@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from src.data.schemas import HourlyLoadPrediction
+from src.data.schemas import ForecastFeatureVector, HourlyLoadPrediction
 
 
 class BaselineForecaster:
@@ -49,33 +49,46 @@ class BaselineForecaster:
 
     def predict(
         self,
-        forecast_start: datetime,
+        forecast_start: datetime | None = None,
         horizon_h: int = 24,
+        target_features: list[ForecastFeatureVector] | None = None,
     ) -> list[HourlyLoadPrediction]:
         """forecast_start 이후 horizon_h 시간의 예측값을 반환한다."""
         if not hasattr(self, "_stats"):
             raise RuntimeError("fit() 을 먼저 호출하세요.")
+        if target_features is None and forecast_start is None:
+            raise ValueError("forecast_start 또는 target_features 중 하나는 필요합니다.")
+
+        target_points: list[tuple[datetime, str, int]] = []
+        if target_features is not None:
+            target_points = [
+                (feature.timestamp, feature.bus_id, feature.hour)
+                for feature in target_features
+            ]
+        else:
+            for h in range(1, horizon_h + 1):
+                ts = forecast_start + timedelta(hours=h)
+                hour = ts.hour
+                for bus_id in self._bus_ids:
+                    target_points.append((ts, bus_id, hour))
 
         results: list[HourlyLoadPrediction] = []
-        for h in range(1, horizon_h + 1):
-            ts = forecast_start + timedelta(hours=h)
-            hour = ts.hour
-            for bus_id in self._bus_ids:
-                row = self._stats[
-                    (self._stats["bus_id"] == bus_id) & (self._stats["hour"] == hour)
-                ]
-                if row.empty:
-                    mu = self._bus_fallback.get(bus_id, 0.0)
-                    sigma = mu * 0.08
-                else:
-                    mu = float(row["mu"].iloc[0])
-                    sigma = float(row["sigma"].iloc[0])
+        for ts, bus_id, hour in target_points:
+            row = self._stats[
+                (self._stats["bus_id"] == bus_id) & (self._stats["hour"] == hour)
+            ]
+            if row.empty:
+                mu = self._bus_fallback.get(bus_id, 0.0)
+                sigma = mu * 0.08
+            else:
+                mu = float(row["mu"].iloc[0])
+                sigma = float(row["sigma"].iloc[0])
 
-                results.append(HourlyLoadPrediction(
-                    timestamp=ts,
-                    bus_id=bus_id,
-                    predicted_load_mw=round(max(0.0, mu), 1),
-                    confidence_lower_mw=round(max(0.0, mu - sigma), 1),
-                    confidence_upper_mw=round(mu + sigma, 1),
-                ))
+            results.append(HourlyLoadPrediction(
+                timestamp=ts,
+                bus_id=bus_id,
+                predicted_load_mw=round(max(0.0, mu), 1),
+                confidence_lower_mw=round(max(0.0, mu - sigma), 1),
+                confidence_upper_mw=round(mu + sigma, 1),
+            ))
         return results

@@ -8,6 +8,13 @@ from src.services.monitoring_service import MonitoringService
 from src.services.result_metadata import (
     build_fallback_info,
     build_fallback_warning,
+    build_no_fallback_info,
+    build_source_warning,
+)
+from src.engine.powerflow import dc_power_flow as _dcpf
+from src.engine.powerflow.congestion_metrics import (
+    compute_congestion_summary,
+    compute_line_statuses,
 )
 from src.data.schemas import (
     FallbackInfo,
@@ -166,7 +173,7 @@ class SimulationService:
         """4주차용 보정 A* + 통합 시뮬레이션 진입점.
 
         설치 전 baseline은 MonitoringService의 DC Power Flow를 사용하고,
-        설치 후 delta는 추천안 기반 heuristic counterfactual로 계산한다.
+        설치 후 delta는 추천안 기반 counterfactual DC Power Flow로 계산한다.
         """
 
         resolved_at = _round_to_hour(created_at or datetime.now())
@@ -386,29 +393,47 @@ class SimulationService:
         monitoring_before: MonitoringResult,
     ) -> tuple[list[SimulationDelta], list[str], FallbackInfo]:
         top_recommendation = recommendations[0] if recommendations else None
-        warnings = [build_fallback_warning("SimulationService", "mock_data")]
         use_actual_baseline = (
             not monitoring_before.fallback.enabled
             and monitoring_before.source == "dc_power_flow"
         )
 
         if use_actual_baseline:
-            deltas = self._build_actual_deltas(
-                monitoring_before=monitoring_before,
-                top_recommendation=top_recommendation,
-            )
-            warnings.append(
-                "설치 전 baseline은 DC Power Flow 결과를 사용하고, 설치 후 delta는 heuristic counterfactual로 계산합니다."
-            )
-            fallback = build_fallback_info(
-                mode="mock_data",
-                reason="설치 후 counterfactual 전력 흐름은 아직 실제 power flow 대신 heuristic 계산을 사용합니다.",
-                primary_path="src.engine.powerflow.dc_power_flow -> counterfactual power flow",
-                active_path="src.services.simulation_service.SimulationService._build_actual_deltas",
-            )
-            return deltas, warnings, fallback
+            try:
+                monitoring_after, counterfactual_warnings = self._build_counterfactual_monitoring(
+                    simulation_input=simulation_input,
+                    monitoring_before=monitoring_before,
+                    top_recommendation=top_recommendation,
+                )
+                deltas = self._build_actual_deltas(
+                    monitoring_before=monitoring_before,
+                    monitoring_after=monitoring_after,
+                    top_recommendation=top_recommendation,
+                )
+                return (
+                    deltas,
+                    [build_source_warning("SimulationService", "astar")] + counterfactual_warnings,
+                    build_no_fallback_info(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                deltas = self._build_heuristic_deltas(
+                    monitoring_before=monitoring_before,
+                    top_recommendation=top_recommendation,
+                )
+                warnings = [
+                    build_fallback_warning("SimulationService", "mock_data"),
+                    f"설치 후 counterfactual DC Power Flow 실패 → heuristic delta 사용. 원인: {exc}",
+                ]
+                fallback = build_fallback_info(
+                    mode="mock_data",
+                    reason="설치 후 counterfactual DC Power Flow 계산에 실패해 heuristic delta를 사용합니다.",
+                    primary_path="src.engine.powerflow.dc_power_flow.solve -> counterfactual network",
+                    active_path="src.services.simulation_service.SimulationService._build_heuristic_deltas",
+                )
+                return deltas, warnings, fallback
 
         deltas = self._build_mock_deltas(simulation_input, top_recommendation)
+        warnings = [build_fallback_warning("SimulationService", "mock_data")]
         warnings.append("경로 탐색과 점수화는 보정된 A* 경로를 사용하고, 설치 전후 비교 delta는 mock 규칙을 사용합니다.")
         if monitoring_before.fallback.enabled:
             warnings.append(
@@ -527,9 +552,247 @@ class SimulationService:
 
         return deltas
 
+    def _build_counterfactual_monitoring(
+        self,
+        *,
+        simulation_input: SimulationInput,
+        monitoring_before: MonitoringResult,
+        top_recommendation: RecommendationResult | None,
+    ) -> tuple[MonitoringResult, list[str]]:
+        buses = _dcpf.build_default_buses(simulation_input.load_scale)
+        line_inputs, reinforced_line_ids = self._build_counterfactual_line_inputs(
+            monitoring_before=monitoring_before,
+            top_recommendation=top_recommendation,
+        )
+        dc_result = _dcpf.solve(buses, line_inputs)
+        if not dc_result.converged:
+            raise RuntimeError(dc_result.error)
+
+        line_statuses = compute_line_statuses(dc_result)
+        congestion_summary = compute_congestion_summary(line_statuses)
+        reinforced_label = ", ".join(reinforced_line_ids) if reinforced_line_ids else "없음"
+        warnings = [
+            "설치 전후 delta는 counterfactual DC Power Flow 결과를 사용합니다.",
+            f"병렬 지원선 적용 대상 선로: {reinforced_label}",
+        ]
+
+        return (
+            MonitoringResult(
+                scenario=simulation_input.scenario,
+                created_at=monitoring_before.created_at,
+                source="dc_power_flow",
+                load_scale=simulation_input.load_scale,
+                line_statuses=line_statuses,
+                congestion_summary=congestion_summary,
+                summary=(
+                    "추천안 적용 후 상위 혼잡 선로에 병렬 지원선을 추가한 "
+                    "counterfactual DC Power Flow 결과입니다."
+                ),
+                warnings=warnings,
+                fallback=build_no_fallback_info(),
+            ),
+            warnings,
+        )
+
+    def _build_counterfactual_line_inputs(
+        self,
+        *,
+        monitoring_before: MonitoringResult,
+        top_recommendation: RecommendationResult | None,
+    ) -> tuple[list[_dcpf.LineInput], list[str]]:
+        line_inputs = _dcpf.build_default_line_inputs()
+        if top_recommendation is None or top_recommendation.score is None:
+            return line_inputs, []
+
+        line_inputs_by_id = {line.line_id: line for line in line_inputs}
+        stressed_lines = [
+            line
+            for line in monitoring_before.line_statuses
+            if line.status in {"warning", "critical", "overload"}
+        ] or monitoring_before.line_statuses[:1]
+
+        route = top_recommendation.route
+        score = top_recommendation.score
+        route_distance_km = route.total_distance_km if route is not None else 0.0
+        route_distance_factor = max(0.70, 1.0 - (route_distance_km / 1000.0))
+        relief_factor = min(0.35, score.congestion_relief / 120.0)
+        reinforcement_count = min(
+            len(stressed_lines),
+            2 if (score.congestion_relief >= 28.0 or route_distance_km <= 48.0) else 1,
+        )
+
+        support_lines: list[_dcpf.LineInput] = []
+        reinforced_line_ids: list[str] = []
+        for index, stressed_line in enumerate(stressed_lines[:reinforcement_count], start=1):
+            base_line = line_inputs_by_id.get(stressed_line.line_id)
+            if base_line is None:
+                continue
+
+            reactance_scale = min(
+                1.22,
+                max(1.04, 1.16 - (relief_factor * 0.22) - ((route_distance_factor - 0.70) * 0.15) + ((index - 1) * 0.06)),
+            )
+            capacity_scale = min(
+                1.10,
+                max(0.90, 0.86 + (relief_factor * 0.45) + (route_distance_factor * 0.12) - ((index - 1) * 0.04)),
+            )
+            support_lines.append(
+                _dcpf.LineInput(
+                    line_id=f"CF_{base_line.line_id}_{index}",
+                    from_bus=base_line.from_bus,
+                    to_bus=base_line.to_bus,
+                    reactance_pu=round(base_line.reactance_pu * reactance_scale, 5),
+                    capacity_mw=round(base_line.capacity_mw * capacity_scale, 1),
+                )
+            )
+            reinforced_line_ids.append(base_line.line_id)
+
+        return line_inputs + support_lines, reinforced_line_ids
+
     def _build_actual_deltas(
         self,
-        monitoring_before,
+        *,
+        monitoring_before: MonitoringResult,
+        monitoring_after: MonitoringResult,
+        top_recommendation: RecommendationResult | None,
+    ) -> list[SimulationDelta]:
+        route = top_recommendation.route if top_recommendation is not None else None
+        before_peak_utilization = round(
+            monitoring_before.congestion_summary.max_utilization * 100.0,
+            1,
+        )
+        after_peak_utilization = round(
+            monitoring_after.congestion_summary.max_utilization * 100.0,
+            1,
+        )
+        before_risk_lines = float(
+            sum(
+                1
+                for line in monitoring_before.line_statuses
+                if line.status in {"warning", "critical", "overload"}
+            )
+        )
+        after_risk_lines = float(
+            sum(
+                1
+                for line in monitoring_after.line_statuses
+                if line.status in {"warning", "critical", "overload"}
+            )
+        )
+        before_losses = round(monitoring_before.congestion_summary.total_loss_mw, 1)
+        after_losses = round(monitoring_after.congestion_summary.total_loss_mw, 1)
+        before_margin = round(max(0.0, 100.0 - before_peak_utilization), 1)
+        after_margin = round(max(0.0, 100.0 - after_peak_utilization), 1)
+
+        if top_recommendation is None:
+            return [
+                SimulationDelta(
+                    metric_id="peak_utilization",
+                    label="최대 선로 이용률",
+                    before_value=before_peak_utilization,
+                    after_value=after_peak_utilization,
+                    unit="%",
+                    improvement=round(before_peak_utilization - after_peak_utilization, 1),
+                    status=_delta_status(after_peak_utilization, before_peak_utilization, lower_is_better=True),
+                ),
+                SimulationDelta(
+                    metric_id="risk_lines",
+                    label="고위험 선로 수",
+                    before_value=before_risk_lines,
+                    after_value=after_risk_lines,
+                    unit="lines",
+                    improvement=round(before_risk_lines - after_risk_lines, 1),
+                    status=_delta_status(after_risk_lines, before_risk_lines, lower_is_better=True),
+                ),
+                SimulationDelta(
+                    metric_id="losses",
+                    label="예상 송전 손실",
+                    before_value=before_losses,
+                    after_value=after_losses,
+                    unit="MW",
+                    improvement=round(before_losses - after_losses, 1),
+                    status=_delta_status(after_losses, before_losses, lower_is_better=True),
+                ),
+                SimulationDelta(
+                    metric_id="operating_margin",
+                    label="운영 여유도",
+                    before_value=before_margin,
+                    after_value=after_margin,
+                    unit="%",
+                    improvement=round(after_margin - before_margin, 1),
+                    status=_delta_status(after_margin, before_margin, lower_is_better=False),
+                ),
+            ]
+
+        deltas = [
+            SimulationDelta(
+                metric_id="peak_utilization",
+                label="최대 선로 이용률",
+                before_value=before_peak_utilization,
+                after_value=after_peak_utilization,
+                unit="%",
+                improvement=round(before_peak_utilization - after_peak_utilization, 1),
+                status=_delta_status(after_peak_utilization, before_peak_utilization, lower_is_better=True),
+            ),
+            SimulationDelta(
+                metric_id="risk_lines",
+                label="고위험 선로 수",
+                before_value=before_risk_lines,
+                after_value=after_risk_lines,
+                unit="lines",
+                improvement=round(before_risk_lines - after_risk_lines, 1),
+                status=_delta_status(after_risk_lines, before_risk_lines, lower_is_better=True),
+            ),
+            SimulationDelta(
+                metric_id="losses",
+                label="예상 송전 손실",
+                before_value=before_losses,
+                after_value=after_losses,
+                unit="MW",
+                improvement=round(before_losses - after_losses, 1),
+                status=_delta_status(after_losses, before_losses, lower_is_better=True),
+            ),
+            SimulationDelta(
+                metric_id="operating_margin",
+                label="운영 여유도",
+                before_value=before_margin,
+                after_value=after_margin,
+                unit="%",
+                improvement=round(after_margin - before_margin, 1),
+                status=_delta_status(after_margin, before_margin, lower_is_better=False),
+            ),
+        ]
+
+        if route is not None:
+            deltas.append(
+                SimulationDelta(
+                    metric_id="route_distance",
+                    label="적용 경로 길이",
+                    before_value=0.0,
+                    after_value=route.total_distance_km,
+                    unit="km",
+                    improvement=round(-route.total_distance_km, 1),
+                    status="worsened",
+                )
+            )
+
+        return deltas
+
+    def _build_heuristic_deltas(
+        self,
+        *,
+        monitoring_before: MonitoringResult,
+        top_recommendation: RecommendationResult | None,
+    ) -> list[SimulationDelta]:
+        return self._build_actual_deltas_heuristic(
+            monitoring_before=monitoring_before,
+            top_recommendation=top_recommendation,
+        )
+
+    def _build_actual_deltas_heuristic(
+        self,
+        *,
+        monitoring_before: MonitoringResult,
         top_recommendation: RecommendationResult | None,
     ) -> list[SimulationDelta]:
         before_peak_utilization = round(

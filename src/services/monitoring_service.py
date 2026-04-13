@@ -276,23 +276,24 @@ class MonitoringService:
         created_at:
             결과 기준 시각. None 이면 현재 시각을 사용한다.
         """
-        now = _round_to_hour(created_at or datetime.now())
+        validated_load_scale, input_warnings = self._validate_load_scale(load_scale)
+        now = self._resolve_created_at(created_at)
         resolved_scenario = self._resolve_scenario(scenario, now)
-        lines = _build_lines(load_scale)
+        lines = _build_lines(validated_load_scale)
         cs = _build_congestion_summary(lines)
-        trend = _build_trend_points(load_scale, now)
+        trend = _build_trend_points(validated_load_scale, now)
 
         return MonitoringResult(
             scenario=resolved_scenario,
             created_at=now,
             source="mock",
-            load_scale=load_scale,
+            load_scale=validated_load_scale,
             line_statuses=lines,
             congestion_summary=cs,
             kpis=_build_kpis(cs, trend),
             trend_points=trend,
             summary=_build_summary_text(cs, lines),
-            warnings=_build_warnings(lines),
+            warnings=input_warnings + _build_warnings(lines),
             fallback=build_fallback_info(
                 mode="mock_data",
                 reason="실제 dc_power_flow 엔진 대신 mock 결과를 사용합니다.",
@@ -321,11 +322,12 @@ class MonitoringService:
         created_at:
             결과 기준 시각. None 이면 현재 시각을 사용한다.
         """
-        now = _round_to_hour(created_at or datetime.now())
+        validated_load_scale, input_warnings = self._validate_load_scale(load_scale)
+        now = self._resolve_created_at(created_at)
         resolved_scenario = self._resolve_scenario(scenario, now)
 
         try:
-            buses = _dcpf.build_default_buses(load_scale)
+            buses = _dcpf.build_default_buses(validated_load_scale)
             lines = _dcpf.build_default_line_inputs()
             dc_result = _dcpf.solve(buses, lines)
 
@@ -334,26 +336,26 @@ class MonitoringService:
 
             line_statuses = compute_line_statuses(dc_result)
             cs = compute_congestion_summary(line_statuses)
-            trend = _build_trend_points(load_scale, now)
+            trend = _build_trend_points(validated_load_scale, now)
 
             return MonitoringResult(
                 scenario=resolved_scenario,
                 created_at=now,
                 source="dc_power_flow",
-                load_scale=load_scale,
+                load_scale=validated_load_scale,
                 line_statuses=line_statuses,
                 congestion_summary=cs,
                 kpis=_build_kpis(cs, trend),
                 trend_points=trend,
                 summary=_build_summary_text(cs, line_statuses),
-                warnings=[build_source_warning("MonitoringService", "dc_power_flow")],
+                warnings=input_warnings + [build_source_warning("MonitoringService", "dc_power_flow")],
                 fallback=build_no_fallback_info(),
             )
 
         except Exception as exc:  # noqa: BLE001
             fallback_result = self.run_mock_monitoring(
                 scenario=resolved_scenario,
-                load_scale=load_scale,
+                load_scale=validated_load_scale,
                 created_at=created_at,
             )
             fallback_result.warnings.insert(
@@ -387,6 +389,8 @@ class MonitoringService:
         scenario: ScenarioContext | None,
         created_at: datetime,
     ) -> ScenarioContext:
+        if scenario is not None and not isinstance(scenario, ScenarioContext):
+            raise TypeError("scenario는 ScenarioContext여야 합니다.")
         if scenario is not None:
             if scenario.created_at is None:
                 scenario.created_at = created_at
@@ -399,3 +403,38 @@ class MonitoringService:
             created_at=created_at,
             created_by="MonitoringService",
         )
+
+    def _resolve_created_at(self, created_at: datetime | None) -> datetime:
+        if created_at is None:
+            return _round_to_hour(datetime.now())
+        if not isinstance(created_at, datetime):
+            raise TypeError("created_at는 datetime 인스턴스여야 합니다.")
+        return _round_to_hour(created_at)
+
+    def _validate_load_scale(self, load_scale: float) -> tuple[float, list[str]]:
+        if isinstance(load_scale, bool):
+            raise ValueError("load_scale는 bool이 아닌 숫자여야 합니다.")
+
+        try:
+            resolved_scale = float(load_scale)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("load_scale는 숫자여야 합니다.") from exc
+
+        if not math.isfinite(resolved_scale):
+            raise ValueError("load_scale는 NaN 또는 무한대가 아닌 유한한 숫자여야 합니다.")
+        if resolved_scale <= 0:
+            raise ValueError("load_scale는 0보다 커야 합니다.")
+
+        warnings: list[str] = []
+        if resolved_scale < 0.5:
+            warnings.append(
+                f"입력 부하 배율 {resolved_scale:.2f}×가 권장 하한 0.50×보다 낮아 0.50×로 보정했습니다."
+            )
+            resolved_scale = 0.5
+        elif resolved_scale > 1.5:
+            warnings.append(
+                f"입력 부하 배율 {resolved_scale:.2f}×가 권장 상한 1.50×보다 높아 1.50×로 보정했습니다."
+            )
+            resolved_scale = 1.5
+
+        return round(resolved_scale, 2), warnings

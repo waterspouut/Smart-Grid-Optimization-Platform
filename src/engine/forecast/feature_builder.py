@@ -97,3 +97,28 @@ def build_feature_matrix(
         for ts in target_timestamps
         for bid in bus_ids
     ]
+
+
+def build_prediction_feature_matrix(
+    load_df: pd.DataFrame,
+    forecast_start: datetime,
+    bus_ids: list[str] | None = None,
+    horizon_h: int = 24,
+    holiday_set: set[str] | None = None,
+) -> list[ForecastFeatureVector]:
+    """예측 서비스가 바로 사용할 수 있는 horizon 구간 피처 목록을 반환한다."""
+    resolved_bus_ids = (
+        list(dict.fromkeys(bus_ids))
+        if bus_ids is not None
+        else sorted(load_df["bus_id"].dropna().unique().tolist())
+    )
+    target_timestamps = [
+        forecast_start + timedelta(hours=h)
+        for h in range(1, horizon_h + 1)
+    ]
+    return build_feature_matrix(
+        load_df=load_df,
+        target_timestamps=target_timestamps,
+        bus_ids=resolved_bus_ids,
+        holiday_set=holiday_set,
+    )

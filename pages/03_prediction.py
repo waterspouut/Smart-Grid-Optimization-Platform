@@ -56,6 +56,73 @@ def _get_shared_scenario() -> ScenarioContext:
     st.session_state.sgop_shared_scenario = scenario
     return scenario
 
+
+def _run_prediction_with_fallback(
+    svc: PredictionService,
+    *,
+    model_source: str,
+    raw_dir: str,
+    load_scale: float,
+    scenario: ScenarioContext,
+    retrain: bool = False,
+    epochs: int = 20,
+) -> PredictionResult:
+    if model_source == "Mock":
+        return svc.run_mock_prediction(
+            load_scale=load_scale,
+            scenario=scenario,
+        )
+
+    try:
+        if model_source == "Baseline":
+            return svc.run_baseline_prediction(
+                raw_dir=raw_dir,
+                load_scale=load_scale,
+                scenario=scenario,
+            )
+        if model_source == "GNN":
+            return svc.run_gnn_prediction(
+                raw_dir=raw_dir,
+                load_scale=load_scale,
+                scenario=scenario,
+            )
+        if model_source == "LSTM+GNN":
+            return svc.run_hybrid_prediction(
+                raw_dir=raw_dir,
+                load_scale=load_scale,
+                forecast_start=None,
+                scenario=scenario,
+                retrain=retrain,
+                epochs=epochs,
+            )
+
+        return svc.run_lstm_prediction(
+            raw_dir=raw_dir,
+            load_scale=load_scale,
+            forecast_start=None,
+            scenario=scenario,
+            retrain=retrain,
+            epochs=epochs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        fallback_result = svc.run_mock_prediction(
+            load_scale=load_scale,
+            scenario=scenario,
+        )
+        fallback_result.summary = (
+            f"{model_source} 예측 실패로 mock 결과를 사용합니다. "
+            f"{fallback_result.summary}"
+        )
+        fallback_result.warnings.insert(
+            0,
+            f"{model_source} 예측 실패 → mock fallback 전환. 원인: {exc}",
+        )
+        fallback_result.fallback.reason = (
+            f"{model_source} 예측이 실패해 mock 패턴 예측 결과를 사용합니다. 원인: {exc}"
+        )
+        return fallback_result
+
+
 _RAW_DIR = str(
     __import__("pathlib").Path(__file__).resolve().parents[1] / "data" / "raw"
 )
@@ -66,16 +133,18 @@ with st.sidebar:
 
     model_source = st.radio(
         "예측 모델",
-        options=["Mock", "Baseline", "LSTM"],
+        options=["Mock", "Baseline", "LSTM", "GNN", "LSTM+GNN"],
         index=0,
         help=(
             "Mock: 합성 패턴 (즉시)\n"
             "Baseline: KPX 실데이터 시간대 평균 (빠름)\n"
-            "LSTM: KPX 실데이터 신경망 예측 (학습 필요)"
+            "LSTM: KPX 실데이터 신경망 예측 (학습 필요)\n"
+            "GNN: 인접 노드 그래프 기반 예측\n"
+            "LSTM+GNN: 두 모델 병렬 조합, 실패 시 baseline 전환"
         ),
     )
 
-    if model_source == "LSTM":
+    if model_source in {"LSTM", "LSTM+GNN"}:
         retrain = st.checkbox("모델 재학습", value=False,
                               help="체크 시 저장된 모델을 무시하고 재학습합니다.")
         epochs = st.slider("에포크", 5, 50, 20, step=5)
@@ -122,35 +191,57 @@ if run_btn or cached_result is None or source_changed:
     if model_source == "Baseline":
         spinner_msg = "KPX 실데이터 로딩 및 Baseline 예측 중..."
         with st.spinner(spinner_msg):
-            try:
-                st.session_state.pred_result = svc.run_baseline_prediction(
-                    raw_dir=_RAW_DIR,
-                    load_scale=load_scale,
-                    scenario=shared_scenario,
-                )
-            except Exception as e:
-                st.error(f"Baseline 예측 실패: {e}")
-                st.stop()
+            st.session_state.pred_result = _run_prediction_with_fallback(
+                svc,
+                model_source=model_source,
+                raw_dir=_RAW_DIR,
+                load_scale=load_scale,
+                scenario=shared_scenario,
+            )
 
     elif model_source == "LSTM":
         spinner_msg = "LSTM 모델 학습/추론 중... (수 분 소요될 수 있습니다)"
         with st.spinner(spinner_msg):
-            try:
-                st.session_state.pred_result = svc.run_lstm_prediction(
-                    raw_dir=_RAW_DIR,
-                    load_scale=load_scale,
-                    forecast_start=None,
-                    scenario=shared_scenario,
-                    retrain=retrain,
-                    epochs=epochs,
-                )
-            except Exception as e:
-                st.error(f"LSTM 예측 실패: {e}")
-                st.stop()
+            st.session_state.pred_result = _run_prediction_with_fallback(
+                svc,
+                model_source=model_source,
+                raw_dir=_RAW_DIR,
+                load_scale=load_scale,
+                scenario=shared_scenario,
+                retrain=retrain,
+                epochs=epochs,
+            )
+
+    elif model_source == "GNN":
+        spinner_msg = "GNN 그래프 예측 중..."
+        with st.spinner(spinner_msg):
+            st.session_state.pred_result = _run_prediction_with_fallback(
+                svc,
+                model_source=model_source,
+                raw_dir=_RAW_DIR,
+                load_scale=load_scale,
+                scenario=shared_scenario,
+            )
+
+    elif model_source == "LSTM+GNN":
+        spinner_msg = "LSTM+GNN 병렬 예측 중... (수 분 소요될 수 있습니다)"
+        with st.spinner(spinner_msg):
+            st.session_state.pred_result = _run_prediction_with_fallback(
+                svc,
+                model_source=model_source,
+                raw_dir=_RAW_DIR,
+                load_scale=load_scale,
+                scenario=shared_scenario,
+                retrain=retrain,
+                epochs=epochs,
+            )
 
     else:  # Mock
         with st.spinner("Mock 예측 중..."):
-            st.session_state.pred_result = svc.run_mock_prediction(
+            st.session_state.pred_result = _run_prediction_with_fallback(
+                svc,
+                model_source=model_source,
+                raw_dir=_RAW_DIR,
                 load_scale=load_scale,
                 scenario=shared_scenario,
             )

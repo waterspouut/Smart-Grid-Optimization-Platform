@@ -15,6 +15,8 @@ from src.data.schemas import (
 from src.services.result_metadata import (
     build_fallback_info,
     build_fallback_warning,
+    build_no_fallback_info,
+    build_source_warning,
 )
 
 # ── 13-노드 정의 ───────────────────────────────────────────────────────────────
@@ -149,7 +151,7 @@ class PredictionService:
             fallback=build_fallback_info(
                 mode="mock_data",
                 reason="실제 예측 모델 대신 PredictionService의 mock 패턴 예측 결과를 사용합니다.",
-                primary_path="src.engine.forecast.feature_builder -> baseline/lstm forecaster",
+                primary_path="src.engine.forecast.feature_builder -> baseline/lstm/gnn forecaster",
                 active_path="src.services.prediction_service.PredictionService.run_mock_prediction",
             ),
         )
@@ -170,33 +172,23 @@ class PredictionService:
         forecast_start : 예측 기준 시각 (None 이면 현재 시각)
         """
         from src.data.adapters.public_data_adapter import load_kpx_csvs
-        from src.engine.forecast.baseline_forecaster import BaselineForecaster
 
         now = (forecast_start or datetime.now()).replace(minute=0, second=0, microsecond=0)
         resolved_scenario = self._resolve_scenario(scenario, now)
 
-        load_df = load_kpx_csvs(raw_dir)
-        if load_scale != 1.0:
-            load_df = load_df.copy()
-            load_df["load_mw"] = load_df["load_mw"] * load_scale
+        load_df = self._apply_load_scale(load_kpx_csvs(raw_dir), load_scale)
+        predictions = self._predict_baseline(
+            load_df=load_df,
+            forecast_start=now,
+        )
 
-        forecaster = BaselineForecaster().fit(load_df)
-        predictions = forecaster.predict(forecast_start=now)
-        risk_lines = self._compute_risk_lines(predictions, load_scale)
-        summary = self._build_summary(now, predictions, risk_lines)
-
-        return PredictionResult(
-            scenario_id=resolved_scenario.scenario_id,
+        return self._build_prediction_result(
+            scenario=resolved_scenario,
             created_at=now,
             load_scale=load_scale,
-            forecast_horizon_h=24,
             predictions=predictions,
-            risk_lines=risk_lines,
-            summary=summary,
             source="baseline",
-            scenario=resolved_scenario,
             warnings=[],
-            fallback=FallbackInfo(enabled=False),
         )
 
     def run_lstm_prediction(
@@ -218,39 +210,148 @@ class PredictionService:
         retrain        : True 이면 저장된 모델 무시하고 재학습
         epochs         : 재학습 시 에포크 수
         """
-        from src.data.adapters.public_data_adapter import load_kpx_with_weather
-        from src.engine.forecast.lstm_forecaster import LSTMForecaster
+        now = (forecast_start or datetime.now()).replace(minute=0, second=0, microsecond=0)
+        resolved_scenario = self._resolve_scenario(scenario, now)
+        load_df = self._load_weather_history(raw_dir)
+        history_df = self._apply_load_scale(load_df, load_scale)
+        target_features = self._build_target_features(
+            load_df=history_df,
+            forecast_start=now,
+        )
+        predictions, warnings = self._predict_lstm(
+            training_df=load_df,
+            history_df=history_df,
+            forecast_start=now,
+            target_features=target_features,
+            retrain=retrain,
+            epochs=epochs,
+        )
 
+        return self._build_prediction_result(
+            scenario=resolved_scenario,
+            created_at=now,
+            load_scale=load_scale,
+            predictions=predictions,
+            source="lstm",
+            warnings=warnings,
+        )
+
+    def run_gnn_prediction(
+        self,
+        raw_dir: str,
+        load_scale: float = 1.0,
+        forecast_start: datetime | None = None,
+        scenario: ScenarioContext | None = None,
+    ) -> PredictionResult:
+        """그래프 기반 최소 GNN 예측 결과를 반환한다."""
         now = (forecast_start or datetime.now()).replace(minute=0, second=0, microsecond=0)
         resolved_scenario = self._resolve_scenario(scenario, now)
 
-        load_df = load_kpx_with_weather(raw_dir)
+        history_df = self._apply_load_scale(self._load_weather_history(raw_dir), load_scale)
+        target_features = self._build_target_features(
+            load_df=history_df,
+            forecast_start=now,
+        )
+        predictions = self._predict_gnn(
+            history_df=history_df,
+            forecast_start=now,
+            target_features=target_features,
+        )
 
-        forecaster = LSTMForecaster()
-        if retrain or not forecaster.is_trained():
-            forecaster.fit(load_df, epochs=epochs)
-
-        if load_scale != 1.0:
-            load_df = load_df.copy()
-            load_df["load_mw"] = load_df["load_mw"] * load_scale
-
-        predictions = forecaster.predict(history_df=load_df, forecast_start=now)
-        risk_lines = self._compute_risk_lines(predictions, load_scale)
-        summary = self._build_summary(now, predictions, risk_lines)
-
-        return PredictionResult(
-            scenario_id=resolved_scenario.scenario_id,
+        return self._build_prediction_result(
+            scenario=resolved_scenario,
             created_at=now,
             load_scale=load_scale,
-            forecast_horizon_h=24,
             predictions=predictions,
-            risk_lines=risk_lines,
-            summary=summary,
-            source="lstm",
-            scenario=resolved_scenario,
+            source="gnn",
             warnings=[],
-            fallback=FallbackInfo(enabled=False),
         )
+
+    def run_hybrid_prediction(
+        self,
+        raw_dir: str,
+        load_scale: float = 1.0,
+        forecast_start: datetime | None = None,
+        scenario: ScenarioContext | None = None,
+        retrain: bool = False,
+        epochs: int = 20,
+    ) -> PredictionResult:
+        """LSTM + GNN 병렬 조합 예측을 반환하고 실패 시 baseline 으로 전환한다."""
+        now = (forecast_start or datetime.now()).replace(minute=0, second=0, microsecond=0)
+        resolved_scenario = self._resolve_scenario(scenario, now)
+        load_df = self._load_weather_history(raw_dir)
+        history_df = self._apply_load_scale(load_df, load_scale)
+        target_features = self._build_target_features(
+            load_df=history_df,
+            forecast_start=now,
+        )
+
+        lstm_predictions: list[HourlyLoadPrediction] | None = None
+        gnn_predictions: list[HourlyLoadPrediction] | None = None
+        lstm_warnings: list[str] = []
+        branch_errors: list[str] = []
+
+        try:
+            lstm_predictions, lstm_warnings = self._predict_lstm(
+                training_df=load_df,
+                history_df=history_df,
+                forecast_start=now,
+                target_features=target_features,
+                retrain=retrain,
+                epochs=epochs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            branch_errors.append(f"LSTM 실패: {_summarize_prediction_error(exc)}")
+
+        try:
+            gnn_predictions = self._predict_gnn(
+                history_df=history_df,
+                forecast_start=now,
+                target_features=target_features,
+            )
+        except Exception as exc:  # noqa: BLE001
+            branch_errors.append(f"GNN 실패: {_summarize_prediction_error(exc)}")
+
+        if lstm_predictions is not None and gnn_predictions is not None:
+            predictions = _combine_prediction_lists(
+                primary=lstm_predictions,
+                secondary=gnn_predictions,
+                primary_weight=0.65,
+                secondary_weight=0.35,
+            )
+            warnings = [
+                build_source_warning("PredictionService", "hybrid"),
+                "LSTM 65% + GNN 35% 가중 평균으로 병렬 조합 예측을 사용합니다.",
+            ]
+            warnings.extend(f"LSTM: {warning}" for warning in lstm_warnings)
+
+            return self._build_prediction_result(
+                scenario=resolved_scenario,
+                created_at=now,
+                load_scale=load_scale,
+                predictions=predictions,
+                source="hybrid",
+                warnings=warnings,
+            )
+
+        baseline_result = self.run_baseline_prediction(
+            raw_dir=raw_dir,
+            load_scale=load_scale,
+            forecast_start=now,
+            scenario=resolved_scenario,
+        )
+        baseline_result.summary = (
+            "LSTM+GNN 병렬 예측 실패로 baseline 결과를 사용합니다. "
+            f"{baseline_result.summary}"
+        )
+        baseline_result.warnings = branch_errors + baseline_result.warnings
+        baseline_result.fallback = build_fallback_info(
+            mode="baseline_model",
+            reason="LSTM+GNN 병렬 예측 중 하나 이상이 실패해 baseline 예측으로 전환했습니다.",
+            primary_path="src.engine.forecast.lstm_forecaster + src.engine.forecast.gnn_forecaster",
+            active_path="src.services.prediction_service.PredictionService.run_baseline_prediction",
+        )
+        return baseline_result
 
     # ── 내부 ──────────────────────────────────────────────────────────────────
 
@@ -376,8 +477,135 @@ class PredictionService:
     def _build_warnings(self) -> list[str]:
         return [
             build_fallback_warning("PredictionService", "mock_data"),
-            "실제 baseline/LSTM 모델이 연결되기 전까지 합성 패턴 기반 예측을 사용합니다.",
+            "실제 baseline/LSTM/GNN 모델이 연결되기 전까지 합성 패턴 기반 예측을 사용합니다.",
         ]
+
+    def _build_prediction_result(
+        self,
+        *,
+        scenario: ScenarioContext,
+        created_at: datetime,
+        load_scale: float,
+        predictions: list[HourlyLoadPrediction],
+        source: str,
+        warnings: list[str],
+    ) -> PredictionResult:
+        risk_lines = self._compute_risk_lines(predictions, load_scale)
+        summary = self._build_summary(created_at, predictions, risk_lines)
+        return PredictionResult(
+            scenario_id=scenario.scenario_id,
+            created_at=created_at,
+            load_scale=load_scale,
+            forecast_horizon_h=24,
+            predictions=predictions,
+            risk_lines=risk_lines,
+            summary=summary,
+            source=source,
+            scenario=scenario,
+            warnings=warnings,
+            fallback=build_no_fallback_info(),
+        )
+
+    def _load_weather_history(self, raw_dir: str) -> pd.DataFrame:
+        from src.data.adapters.public_data_adapter import load_kpx_with_weather
+
+        return load_kpx_with_weather(raw_dir)
+
+    def _apply_load_scale(self, load_df: pd.DataFrame, load_scale: float) -> pd.DataFrame:
+        if load_scale == 1.0:
+            return load_df
+
+        scaled_df = load_df.copy()
+        scaled_df["load_mw"] = scaled_df["load_mw"] * load_scale
+        return scaled_df
+
+    def _build_target_features(
+        self,
+        *,
+        load_df: pd.DataFrame,
+        forecast_start: datetime,
+    ) -> list:
+        from src.engine.forecast.feature_builder import build_prediction_feature_matrix
+
+        return build_prediction_feature_matrix(
+            load_df=load_df,
+            forecast_start=forecast_start,
+        )
+
+    def _predict_baseline(
+        self,
+        *,
+        load_df: pd.DataFrame,
+        forecast_start: datetime,
+    ) -> list[HourlyLoadPrediction]:
+        from src.engine.forecast.baseline_forecaster import BaselineForecaster
+
+        forecaster = BaselineForecaster().fit(load_df)
+        target_features = self._build_target_features(
+            load_df=load_df,
+            forecast_start=forecast_start,
+        )
+        return forecaster.predict(target_features=target_features)
+
+    def _predict_lstm(
+        self,
+        *,
+        training_df: pd.DataFrame,
+        history_df: pd.DataFrame,
+        forecast_start: datetime,
+        target_features: list,
+        retrain: bool,
+        epochs: int,
+    ) -> tuple[list[HourlyLoadPrediction], list[str]]:
+        from src.engine.forecast.lstm_forecaster import LSTMForecaster
+
+        forecaster = LSTMForecaster()
+        if retrain or not forecaster.is_trained():
+            forecaster.fit(training_df, epochs=epochs)
+
+        warnings: list[str] = []
+        try:
+            predictions = forecaster.predict(
+                history_df=history_df,
+                forecast_start=forecast_start,
+                target_features=target_features,
+            )
+        except Exception as exc:
+            if retrain or not _is_recoverable_lstm_model_error(exc):
+                raise
+
+            forecaster = LSTMForecaster()
+            forecaster.fit(training_df, epochs=epochs)
+            predictions = forecaster.predict(
+                history_df=history_df,
+                forecast_start=forecast_start,
+                target_features=target_features,
+            )
+            warnings.append(
+                "저장된 LSTM 모델 로드에 실패해 현재 환경에서 재학습 후 예측을 수행했습니다."
+            )
+            warnings.append(f"LSTM 모델 재학습 원인: {_summarize_lstm_model_error(exc)}")
+
+        return predictions, warnings
+
+    def _predict_gnn(
+        self,
+        *,
+        history_df: pd.DataFrame,
+        forecast_start: datetime,
+        target_features: list,
+    ) -> list[HourlyLoadPrediction]:
+        from src.engine.forecast.gnn_forecaster import GNNForecaster
+
+        return (
+            GNNForecaster()
+            .fit(history_df)
+            .predict(
+                history_df=history_df,
+                forecast_start=forecast_start,
+                target_features=target_features,
+            )
+        )
 
 
 # ── 순수 함수 ──────────────────────────────────────────────────────────────────
@@ -390,6 +618,77 @@ def _classify_risk(utilization: float) -> str:
     if utilization >= 0.55:
         return "medium"
     return "low"
+
+
+def _is_recoverable_lstm_model_error(exc: Exception) -> bool:
+    message = str(exc)
+    recoverable_markers = (
+        "could not be deserialized properly",
+        "quantization_config",
+        "load_model",
+    )
+    return any(marker in message for marker in recoverable_markers)
+
+
+def _summarize_lstm_model_error(exc: Exception) -> str:
+    message = str(exc)
+    if "quantization_config" in message:
+        return "저장된 model.keras가 현재 Keras 버전의 Dense 설정과 호환되지 않았습니다."
+    if "could not be deserialized properly" in message:
+        return "저장된 model.keras를 현재 Keras 환경에서 역직렬화하지 못했습니다."
+    if "load_model" in message:
+        return "저장된 LSTM 모델 로드에 실패했습니다."
+    return message.splitlines()[0] if message else exc.__class__.__name__
+
+
+def _summarize_prediction_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message.splitlines()[0] if message else exc.__class__.__name__
+
+
+def _combine_prediction_lists(
+    *,
+    primary: list[HourlyLoadPrediction],
+    secondary: list[HourlyLoadPrediction],
+    primary_weight: float,
+    secondary_weight: float,
+) -> list[HourlyLoadPrediction]:
+    secondary_map = {
+        (prediction.timestamp, prediction.bus_id): prediction
+        for prediction in secondary
+    }
+    combined: list[HourlyLoadPrediction] = []
+    total_weight = primary_weight + secondary_weight
+
+    for prediction in primary:
+        key = (prediction.timestamp, prediction.bus_id)
+        secondary_prediction = secondary_map.get(key)
+        if secondary_prediction is None:
+            raise ValueError(f"병렬 조합 대상 예측 키가 맞지 않습니다: {key}")
+
+        predicted_load = (
+            (prediction.predicted_load_mw * primary_weight)
+            + (secondary_prediction.predicted_load_mw * secondary_weight)
+        ) / total_weight
+        lower_bound = (
+            (prediction.confidence_lower_mw * primary_weight)
+            + (secondary_prediction.confidence_lower_mw * secondary_weight)
+        ) / total_weight
+        upper_bound = (
+            (prediction.confidence_upper_mw * primary_weight)
+            + (secondary_prediction.confidence_upper_mw * secondary_weight)
+        ) / total_weight
+        combined.append(
+            HourlyLoadPrediction(
+                timestamp=prediction.timestamp,
+                bus_id=prediction.bus_id,
+                predicted_load_mw=round(predicted_load, 1),
+                confidence_lower_mw=round(max(0.0, lower_bound), 1),
+                confidence_upper_mw=round(max(predicted_load, upper_bound), 1),
+            )
+        )
+
+    return combined
 
 
 def _build_explanation(

@@ -32,6 +32,8 @@ ResultSource = Literal[
     "mock",
     "baseline",
     "lstm",
+    "gnn",
+    "hybrid",
     "dc_power_flow",
     "heuristic",
     "astar",
@@ -341,6 +343,8 @@ class PredictionResult:
     "mock"     : 합성 sinusoidal 데이터 (1주차 기본값)
     "baseline" : 이동평균 / 계절성 분해 baseline 모델
     "lstm"     : 훈련된 LSTM 모델
+    "gnn"      : 그래프 기반 예측 모델
+    "hybrid"   : LSTM + GNN 병렬 조합 모델
     """
 
     scenario_id: str
@@ -350,7 +354,7 @@ class PredictionResult:
     predictions: list[HourlyLoadPrediction]
     risk_lines: list[RiskLine]        # risk_level != "low" 인 선로만 포함, 이용률 내림차순
     summary: str
-    source: Literal["lstm", "baseline", "mock"]
+    source: ResultSource
     scenario: ScenarioContext | None = None
     warnings: list[str] = field(default_factory=list)
     fallback: FallbackInfo = field(default_factory=lambda: FallbackInfo(enabled=False))
